@@ -24,11 +24,10 @@ export default class GeoIPDownloader {
 	}
 
 	private async ensureDirectoryExists(): Promise<void> {
-		let stat;
 		try {
-			stat = await fs.stat(this.directory);
+			await fs.stat(this.directory);
 		} catch (e) {
-			var error = e as NodeJS.ErrnoException;
+			const error = e as NodeJS.ErrnoException;
 			if (error.code === 'ENOTDIR') {
 				this.logger.warn('File exists at GeoIP directory path, unlinking...');
 				await fs.unlink(this.directory.substring(0, this.directory.length - 1));
@@ -49,7 +48,7 @@ export default class GeoIPDownloader {
 			await fs.access(dbpath, fs.constants.F_OK | fs.constants.R_OK);
 			this.logger.info('Loading cached GeoIP database: {0}', dbpath);
 		} catch (ex) {
-			var error = ex as NodeJS.ErrnoException;
+			const error = ex as NodeJS.ErrnoException;
 			if (error.code === 'ENOENT') {
 				await this.downloadLatestDatabase();
 			} else {
@@ -61,19 +60,23 @@ export default class GeoIPDownloader {
 	}
 
 	async getLatestVersion(): Promise<string> {
-		let res = await fetch('https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz', {
+		const res = await fetch('https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz', {
 			redirect: 'follow',
 			method: 'HEAD',
 			headers: {
 				Authorization: this.genAuthHeader()
 			}
 		});
-		let disposition = res.headers.get('Content-Disposition');
+		if (!res.ok) {
+			this.logger.error(`Failed to get latest version of GeoIP database: HTTP ${res.status}`);
+			process.exit(1);
+		}
+		const disposition = res.headers.get('Content-Disposition');
 		if (!disposition) {
 			this.logger.error('Failed to get latest version of GeoIP database: No Content-Disposition header');
 			process.exit(1);
 		}
-		let filename = disposition.match(/filename=(.*)$/);
+		const filename = disposition.match(/filename=(.*)$/);
 		if (!filename) {
 			this.logger.error('Failed to get latest version of GeoIP database: Could not parse version from Content-Disposition header');
 			process.exit(1);
@@ -82,18 +85,22 @@ export default class GeoIPDownloader {
 	}
 
 	async downloadLatestDatabase(): Promise<void> {
-		let filename = await this.getLatestVersion();
+		const filename = await this.getLatestVersion();
 		this.logger.info('Downloading latest GeoIP database: {0}', filename);
-		let dbpath = path.join(this.directory, filename);
-		let file = await fs.open(dbpath, fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_WRONLY);
-		let stream = file.createWriteStream();
-		let res = await fetch('https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz', {
+		const dbpath = path.join(this.directory, filename);
+		const file = await fs.open(dbpath, fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_WRONLY);
+		const stream = file.createWriteStream();
+		const res = await fetch('https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz', {
 			redirect: 'follow',
 			headers: {
 				Authorization: this.genAuthHeader()
 			}
 		});
-		await finished(Readable.fromWeb(res.body as ReadableStream<any>).pipe(stream));
+		if (!res.ok || !res.body) {
+			this.logger.error(`Failed to download GeoIP database: HTTP ${res.status}`);
+			process.exit(1);
+		}
+		await finished(Readable.fromWeb(res.body as ReadableStream<Uint8Array>).pipe(stream));
 		await file.close();
 		this.logger.info('Finished downloading latest GeoIP database: {0}', filename);
 		this.logger.info('Extracting GeoIP database: {0}', filename);

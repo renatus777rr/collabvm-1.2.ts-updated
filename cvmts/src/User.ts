@@ -86,10 +86,10 @@ export class User {
 	}
 
 	assignGuestName(existingUsers: string[]): string {
-		var username;
+		let username: string;
 		do {
 			username = 'guest' + Utilities.Randint(10000, 99999);
-		} while (existingUsers.indexOf(username) !== -1);
+		} while (existingUsers.includes(username));
 		this.logger.info({event: "assign guest username"});
 		this.username = username;
 		return username;

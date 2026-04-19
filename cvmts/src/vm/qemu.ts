@@ -8,9 +8,9 @@ import { CgroupLimits, QemuResourceLimitedLauncher } from './qemu_launcher.js';
 
 // shim over superqemu because it diverges from the VM interface
 export class QemuVMShim implements VM {
-	private vm;
+	private vm: QemuVM;
 	private display: VncDisplay | null = null;
-	private logger;
+	private logger: pino.Logger;
 	private cg_launcher: QemuResourceLimitedLauncher | null = null;
 	private resource_limits: CgroupLimits | null = null;
 
@@ -18,7 +18,7 @@ export class QemuVMShim implements VM {
 		this.logger = pino({ name: `CVMTS.QemuVMShim/${def.id}` });
 
 		if (resourceLimits) {
-			if (process.platform == 'linux') {
+			if (process.platform === 'linux') {
 				this.resource_limits = resourceLimits;
 				this.cg_launcher = new QemuResourceLimitedLauncher(def.id, resourceLimits);
 				this.vm = new QemuVM(def, this.cg_launcher);
@@ -33,7 +33,7 @@ export class QemuVMShim implements VM {
 		}
 
 		this.vm.on('statechange', async (newState) => {
-			if (newState == VMState.Started) {
+			if (newState === VMState.Started) {
 				await this.PlaceVCPUThreadsIntoCGroup();
 			}
 		});
@@ -58,7 +58,7 @@ export class QemuVMShim implements VM {
 		return this.vm.Reset();
 	}
 
-	MonitorCommand(command: string): Promise<any> {
+	MonitorCommand(command: string): Promise<unknown> {
 		return this.vm.MonitorCommand(command);
 	}
 
@@ -66,7 +66,7 @@ export class QemuVMShim implements VM {
 		let pin_vcpu_threads = false;
 		if (this.cg_launcher) {
 			// messy as all hell but oh well
-			if (this.resource_limits?.limitProcess == undefined) {
+			if (this.resource_limits?.limitProcess === undefined) {
 				pin_vcpu_threads = true;
 			} else {
 				pin_vcpu_threads = !this.resource_limits?.limitProcess;
@@ -74,8 +74,8 @@ export class QemuVMShim implements VM {
 
 			if (pin_vcpu_threads) {
 				// Get all vCPUs and pin them to the CGroup.
-				let cpu_res = await this.vm.QmpCommand('query-cpus-fast', {});
-				for (let cpu of cpu_res) {
+				const cpu_res = await this.vm.QmpCommand('query-cpus-fast', {});
+				for (const cpu of cpu_res) {
 					this.logger.info(`Placing vCPU thread with TID ${cpu['thread-id']} to cgroup`);
 					this.cg_launcher.group.AttachThread(cpu['thread-id']);
 				}
@@ -85,9 +85,9 @@ export class QemuVMShim implements VM {
 
 	StartDisplay(): void {
 		// boot it up
-		let info = this.vm.GetDisplayInfo();
+		const info = this.vm.GetDisplayInfo();
 
-		if (info == null) throw new Error('its dead jim');
+		if (info === null) throw new Error('display info unavailable');
 
 		switch (info.type) {
 			case 'vnc-tcp':
@@ -104,15 +104,11 @@ export class QemuVMShim implements VM {
 				break;
 		}
 
-		let self = this;
-
 		this.display?.on('connected', () => {
-			// The VM can now be considered started
-			self.logger.info('Display connected');
+			this.logger.info('Display connected');
 		});
 
-		// now that QMP has connected, connect to the display
-		self.display?.Connect();
+		this.display?.Connect();
 	}
 
 	GetDisplay(): VMDisplay | null {

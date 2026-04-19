@@ -1,8 +1,8 @@
 import { Rank, User } from './User.js';
 
 export default class AuthManager {
-	apiEndpoint: string;
-	secretKey: string;
+	private apiEndpoint: string;
+	private secretKey: string;
 
 	constructor(apiEndpoint: string, secretKey: string) {
 		this.apiEndpoint = apiEndpoint;
@@ -10,7 +10,7 @@ export default class AuthManager {
 	}
 
 	async Authenticate(token: string, user: User): Promise<JoinResponse> {
-		let response = await fetch(this.apiEndpoint + '/api/v1/join', {
+		const response = await fetch(`${this.apiEndpoint}/api/v1/join`, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json'
@@ -25,7 +25,7 @@ export default class AuthManager {
 		// Make sure the fetch returned okay
 		if (!response.ok) throw new Error(`Failed to query auth server: ${response.statusText}`);
 
-		let json = (await response.json()) as JoinResponse;
+		const json = (await response.json()) as JoinResponse;
 
 		if (!json.success) throw new Error(json.error);
 

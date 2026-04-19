@@ -7,17 +7,13 @@ import { execaCommand } from 'execa';
 import pino from 'pino';
 import { VncDisplay } from '../../display/vnc.js';
 
-function Clamp(input: number, min: number, max: number) {
-	return Math.min(Math.max(input, min), max);
-}
-
 async function Sleep(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default class VNCVM extends EventEmitter implements VM {
 	def: VNCVMDef;
-	logger;
+	logger: pino.Logger;
 	private vnc: VncDisplay | null = null;
 	private state = VMState.Stopped;
 
@@ -51,7 +47,6 @@ export default class VNCVM extends EventEmitter implements VM {
 
 	StartDisplay(): void {
 		this.logger.info('Connecting to VNC server');
-		let self = this;
 
 		this.vnc = new VncDisplay({
 			host: this.def.vncHost,
@@ -59,12 +54,12 @@ export default class VNCVM extends EventEmitter implements VM {
 			path: null
 		});
 
-		self.vnc!.on('connected', () => {
-			self.logger.info('Connected to VNC server');
-			self.SetState(VMState.Started);
+		this.vnc.on('connected', () => {
+			this.logger.info('Connected to VNC server');
+			this.SetState(VMState.Started);
 		});
 
-		self.vnc!.Connect();
+		this.vnc.Connect();
 	}
 
 	async Start(): Promise<void> {
@@ -84,7 +79,7 @@ export default class VNCVM extends EventEmitter implements VM {
 		if (this.def.rebootCmd) await execaCommand(this.def.rebootCmd, { shell: true });
 	}
 
-	async MonitorCommand(command: string): Promise<any> {
+	async MonitorCommand(command: string): Promise<unknown> {
 		// TODO: This can maybe run a specified command?
 		return 'This VM does not support monitor commands.';
 	}

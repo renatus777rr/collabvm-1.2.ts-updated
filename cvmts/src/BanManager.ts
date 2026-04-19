@@ -46,13 +46,14 @@ export class BanManager {
 		// If ban command enabled, run it
 		try {
 			if (Array.isArray(this.cfg.bancmd)) {
-				let args: string[] = this.cfg.bancmd.map((a: string) => this.banCmdArgs(a, ip, username));
-				if (args.length || args[0].length) {
+				const args = this.cfg.bancmd.map((a: string) => this.banCmdArgs(a, ip, username)).filter((a) => a.length > 0);
+				const [command, ...commandArgs] = args;
+				if (command) {
 					this.logger.info(`Running "${JSON.stringify(args)}"`);
-					await execa(args.shift()!, args, { stdout: process.stdout, stderr: process.stderr });
+					await execa(command, commandArgs, { stdout: process.stdout, stderr: process.stderr });
 				}
 			} else if (typeof this.cfg.bancmd == 'string') {
-				let cmd: string = this.banCmdArgs(this.cfg.bancmd, ip, username);
+				const cmd = this.banCmdArgs(this.cfg.bancmd, ip, username);
 				if (cmd.length) {
 					// Run through JSON.stringify for char escaping
 					this.logger.info(`Running ${JSON.stringify(cmd)}`);

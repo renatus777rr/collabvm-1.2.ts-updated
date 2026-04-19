@@ -1,5 +1,4 @@
-import { IProtocol } from './Protocol';
-import { User } from '../User';
+import { IProtocol } from './Protocol.js';
 
 // The protocol manager.
 // Holds protocols, and provides the ability to obtain them by name. 
@@ -7,7 +6,7 @@ import { User } from '../User';
 // Avoids direct dependency on a given list of protocols,
 // and allows (relatively simple) expansion of the supported protocols.
 export class ProtocolManager {
-	private protocols = new Map<String, IProtocol>();
+	private protocols = new Map<string, IProtocol>();
 
 	// Registers a protocol with the given name, creates it, and stores it for later use.
 	registerProtocol(name: string, protocolFactory: () => IProtocol) {
@@ -16,11 +15,11 @@ export class ProtocolManager {
 
 	// Gets an instance of a protocol.
 	getProtocol(name: string): IProtocol {
-		let proto = this.protocols.get(name);
-		if (proto == undefined) throw new Error(`ProtocolManager does not have protocol \"${name}\"`);
+		const proto = this.protocols.get(name);
+		if (proto === undefined) throw new Error(`ProtocolManager does not have protocol "${name}"`);
 		return proto;
 	}
 }
 
 /// Global protocol manager
-export let TheProtocolManager = new ProtocolManager();
+export const TheProtocolManager = new ProtocolManager();

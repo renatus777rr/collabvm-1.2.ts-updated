@@ -17,7 +17,7 @@ export default interface VM {
 	Reset(): Promise<void>;
 
 	// Monitor command
-	MonitorCommand(command: string): Promise<any>;
+	MonitorCommand(command: string): Promise<unknown>;
 
 	// Start/connect the display
 	StartDisplay(): void;

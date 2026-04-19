@@ -29,8 +29,8 @@ export class GuacamoleProtocol implements IProtocol {
 			case '13':
 				{
 					if (decodedElements.length !== 3) return false;
-					let choice = parseInt(decodedElements[2]);
-					if (choice == undefined) return false;
+					const choice = Number.parseInt(decodedElements[2], 10);
+					if (Number.isNaN(choice)) return false;
 					handler.onAdminForceVote(user, choice);
 				}
 				break;
@@ -38,8 +38,8 @@ export class GuacamoleProtocol implements IProtocol {
 				{
 					if (decodedElements.length !== 4) return false;
 					let temporary = true;
-					if (decodedElements[3] == '0') temporary = true;
-					else if (decodedElements[3] == '1') temporary = false;
+					if (decodedElements[3] === '0') temporary = true;
+					else if (decodedElements[3] === '1') temporary = false;
 					else return false;
 					handler.onAdminMuteUser(user, decodedElements[2], temporary);
 				}
@@ -76,8 +76,8 @@ export class GuacamoleProtocol implements IProtocol {
 					// Toggle turns
 					if (decodedElements.length !== 3) return false;
 					let enabled = true;
-					if (decodedElements[2] == '0') enabled = false;
-					else if (decodedElements[2] == '1') enabled = true;
+					if (decodedElements[2] === '0') enabled = false;
+					else if (decodedElements[2] === '1') enabled = true;
 					else return false;
 					handler.onAdminToggleTurns(user, enabled);
 				}
@@ -89,8 +89,8 @@ export class GuacamoleProtocol implements IProtocol {
 				{
 					if (decodedElements.length !== 3) return false;
 					let show = true;
-					if (decodedElements[2] == '0') show = false;
-					else if (decodedElements[2] == '1') show = true;
+					if (decodedElements[2] === '0') show = false;
+					else if (decodedElements[2] === '1') show = true;
 					else return false;
 					handler.onAdminHideScreen(user, show);
 				}
@@ -102,8 +102,8 @@ export class GuacamoleProtocol implements IProtocol {
 			case '26':
 				if (decodedElements.length !== 3) return false;
 				let shadow = true;
-				if (decodedElements[2] == '0') shadow = false;
-				else if (decodedElements[2] == '1') shadow = true;
+				if (decodedElements[2] === '0') shadow = false;
+				else if (decodedElements[2] === '1') shadow = true;
 				else return false;
 				handler.onAdminShadow(user, shadow);
 				break;
@@ -141,8 +141,8 @@ export class GuacamoleProtocol implements IProtocol {
 			case 'view':
 				{
 					if (decodedElements.length !== 3) return false;
-					let viewMode = parseInt(decodedElements[2]);
-					if (viewMode == undefined) return false;
+					const viewMode = Number.parseInt(decodedElements[2], 10);
+					if (Number.isNaN(viewMode)) return false;
 
 					handler.onView(user, decodedElements[1], viewMode);
 				}
@@ -157,11 +157,11 @@ export class GuacamoleProtocol implements IProtocol {
 			case 'turn':
 				let forfeit = false;
 				if (decodedElements.length > 2) return false;
-				if (decodedElements.length == 1) {
+				if (decodedElements.length === 1) {
 					forfeit = false;
 				} else {
-					if (decodedElements[1] == '0') forfeit = true;
-					else if (decodedElements[1] == '1') forfeit = false;
+					if (decodedElements[1] === '0') forfeit = true;
+					else if (decodedElements[1] === '1') forfeit = false;
 				}
 
 				handler.onTurnRequest(user, forfeit);
@@ -169,24 +169,24 @@ export class GuacamoleProtocol implements IProtocol {
 			case 'mouse':
 				if (decodedElements.length !== 4) return false;
 
-				let x = parseInt(decodedElements[1]);
-				let y = parseInt(decodedElements[2]);
-				let mask = parseInt(decodedElements[3]);
-				if (x === undefined || y === undefined || mask === undefined) return false;
+				const x = Number.parseInt(decodedElements[1], 10);
+				const y = Number.parseInt(decodedElements[2], 10);
+				const mask = Number.parseInt(decodedElements[3], 10);
+				if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(mask)) return false;
 
 				handler.onMouse(user, x, y, mask);
 				break;
 			case 'key':
 				if (decodedElements.length !== 3) return false;
-				var keysym = parseInt(decodedElements[1]);
-				var down = parseInt(decodedElements[2]);
-				if (keysym === undefined || (down !== 0 && down !== 1)) return false;
+				const keysym = Number.parseInt(decodedElements[1], 10);
+				const down = Number.parseInt(decodedElements[2], 10);
+				if (Number.isNaN(keysym) || (down !== 0 && down !== 1)) return false;
 				handler.onKey(user, keysym, down === 1);
 				break;
 			case 'vote':
 				if (decodedElements.length !== 2) return false;
-				let choice = parseInt(decodedElements[1]);
-				if (choice == undefined) return false;
+				const choice = Number.parseInt(decodedElements[1], 10);
+				if (Number.isNaN(choice)) return false;
 				handler.onVote(user, choice);
 				break;
 
@@ -236,7 +236,7 @@ export class GuacamoleProtocol implements IProtocol {
 
 	sendAdminLoginResponse(user: User, ok: boolean, modPerms: number | undefined): void {
 		if (ok) {
-			if (modPerms == undefined) {
+			if (modPerms === undefined) {
 				user.sendMsg(cvm.guacEncode('admin', '0', '1'));
 			} else {
 				user.sendMsg(cvm.guacEncode('admin', '0', '3', modPerms.toString()));

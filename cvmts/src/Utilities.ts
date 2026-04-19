@@ -21,8 +21,8 @@ export function Randint(min: number, max: number) {
 }
 
 export function HTMLSanitize(input: string): string {
-	var output = '';
-	for (var i = 0; i < input.length; i++) {
+	let output = '';
+	for (let i = 0; i < input.length; i++) {
 		switch (input[i]) {
 			case '<':
 				output += '&lt;';
@@ -46,7 +46,7 @@ export function HTMLSanitize(input: string): string {
 				output += '&#13;&#10;';
 				break;
 			default:
-				var charcode: number = input.charCodeAt(i);
+				const charcode = input.charCodeAt(i);
 				if (charcode >= 32 && charcode <= 126) output += input[i];
 				break;
 		}
@@ -55,7 +55,7 @@ export function HTMLSanitize(input: string): string {
 }
 
 export function MakeModPerms(modperms: Permissions): number {
-	var perms = 0;
+	let perms = 0;
 	if (modperms.restore) perms |= 1;
 	if (modperms.reboot) perms |= 2;
 	if (modperms.ban) perms |= 4;

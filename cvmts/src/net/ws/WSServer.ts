@@ -78,14 +78,14 @@ export default class WSServer extends EventEmitter implements NetworkServer {
 	}
 
 	private async httpOnUpgrade(req: http.IncomingMessage, socket: internal.Duplex, head: Buffer) {
-		var killConnection = () => {
+		const killConnection = () => {
 			socket.write('HTTP/1.1 400 Bad Request\n\n400 Bad Request');
 			socket.destroy();
 		};
 
 		let protocol = req.headers['sec-websocket-protocol'];
 
-		if (!protocol || kAllowedProtocols.indexOf(protocol) === -1) {
+		if (!protocol || !kAllowedProtocols.includes(protocol)) {
 			killConnection();
 			return;
 		}
@@ -98,24 +98,22 @@ export default class WSServer extends EventEmitter implements NetworkServer {
 			}
 
 			// Try to parse the Origin header sent by the client, if it fails, kill the connection.
-			var _uri;
-			var _host;
+			let originUri: URL;
 			try {
-				_uri = new URL(req.headers.origin.toLowerCase());
-				_host = _uri.host;
+				originUri = new URL(req.headers.origin.toLowerCase());
 			} catch {
 				killConnection();
 				return;
 			}
 
 			// detect fake origin headers
-			if (_uri.pathname !== '/' || _uri.search !== '') {
+			if (originUri.pathname !== '/' || originUri.search !== '') {
 				killConnection();
 				return;
 			}
 
 			// If the domain name is not in the list of allowed origins, kill the connection.
-			if (!this.Config.http.originAllowedDomains.includes(_host)) {
+			if (!this.Config.http.originAllowedDomains.includes(originUri.host)) {
 				killConnection();
 				return;
 			}
@@ -124,7 +122,7 @@ export default class WSServer extends EventEmitter implements NetworkServer {
 		let ip: string;
 		if (this.Config.http.proxying) {
 			// If the requesting IP isn't allowed to proxy, kill it
-			if (this.Config.http.proxyAllowedIps.indexOf(req.socket.remoteAddress!) === -1) {
+			if (!this.Config.http.proxyAllowedIps.includes(req.socket.remoteAddress!)) {
 				killConnection();
 				return;
 			}

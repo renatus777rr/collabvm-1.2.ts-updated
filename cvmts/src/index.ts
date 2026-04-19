@@ -19,7 +19,7 @@ import { TheProtocolManager } from './protocol/Manager.js';
 import { GuacamoleProtocol } from './protocol/GuacamoleProtocol.js';
 import { BinRectsProtocol } from './protocol/BinRectsProtocol.js';
 
-let logger = pino();
+const logger = pino();
 
 logger.info('CollabVM Server starting up');
 
@@ -32,7 +32,7 @@ if (!fs.existsSync('config.toml')) {
 	process.exit(1);
 }
 try {
-	var configRaw = fs.readFileSync('config.toml').toString();
+	const configRaw = fs.readFileSync('config.toml').toString();
 	Config = toml.parse(configRaw);
 } catch (e) {
 	logger.error({err: e}, 'Fatal error: Failed to read or parse the config file');
@@ -52,11 +52,11 @@ async function stop() {
 async function start() {
 	let geoipReader = null;
 	if (Config.geoip.enabled) {
-		let downloader = new GeoIPDownloader(Config.geoip.directory, Config.geoip.accountID, Config.geoip.licenseKey);
+		const downloader = new GeoIPDownloader(Config.geoip.directory, Config.geoip.accountID, Config.geoip.licenseKey);
 		geoipReader = await downloader.getGeoIPReader();
 	}
 	// Init the auth manager if enabled
-	let auth = Config.auth.enabled ? new AuthManager(Config.auth.apiEndpoint, Config.auth.secretKey) : null;
+	const auth = Config.auth.enabled ? new AuthManager(Config.auth.apiEndpoint, Config.auth.secretKey) : null;
 	// Database and ban manager
 	if (Config.bans.cvmban && !Config.mysql.enabled) {
 		logger.error('MySQL must be configured to use cvmban.');
@@ -65,16 +65,16 @@ async function start() {
 	if (!Config.bans.cvmban && !Config.bans.bancmd) {
 		logger.warn('Neither cvmban nor ban command are configured. Bans will not function.');
 	}
-	let db = undefined;
+	let db: Database | undefined;
 	if (Config.mysql.enabled) {
 		db = new Database(Config.mysql);
 		await db.init();
 	}
-	let banmgr = new BanManager(Config.bans, db);
+	const banmgr = new BanManager(Config.bans, db);
 	switch (Config.vm.type) {
 		case 'qemu': {
 			// Fire up the VM
-			let def: QemuVmDefinition = {
+			const def: QemuVmDefinition = {
 				id: Config.collabvm.node,
 				command: Config.qemu.qemuArgs,
 				snapshot: Config.qemu.snapshots,
@@ -100,15 +100,15 @@ async function start() {
 	process.on('SIGTERM', async () => await stop());
 
 	// Register protocol(s) that the server supports
-	TheProtocolManager.registerProtocol("guacamole", () => new GuacamoleProtocol);
-	TheProtocolManager.registerProtocol("binary1", () => new BinRectsProtocol);
+	TheProtocolManager.registerProtocol('guacamole', () => new GuacamoleProtocol());
+	TheProtocolManager.registerProtocol('binary1', () => new BinRectsProtocol());
 
 	// Start up the server
-	var CVM = new CollabVMServer(Config, VM, banmgr, auth, geoipReader);
+	const cvmServer = new CollabVMServer(Config, VM, banmgr, auth, geoipReader);
 	await VM.Start();
 
-	var WS = new WSServer(Config, banmgr);
-	WS.on('connect', (client: User) => CVM.connectionOpened(client));
-	WS.start();
+	const wsServer = new WSServer(Config, banmgr);
+	wsServer.on('connect', (client: User) => cvmServer.connectionOpened(client));
+	wsServer.start();
 }
 start();

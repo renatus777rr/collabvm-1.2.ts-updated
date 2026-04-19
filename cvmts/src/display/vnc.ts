@@ -10,7 +10,7 @@ const kReconnectDelayMs = 2000;
 
 interface VncState {
   vnc: VncClient;
-  connectOpts: any;
+  connectOpts: Record<string, unknown>;
   reconnectAttempts: number;
   shouldReconnect: boolean;
   rectBuffer: Rect[];
@@ -20,7 +20,7 @@ export class VncDisplay extends EventEmitter implements VMDisplay {
   private state: VncState;
   private reconnectTimer?: NodeJS.Timeout;
 
-  constructor(connectOpts: any) {
+  constructor(connectOpts: Record<string, unknown>) {
     super();
     this.state = {
       vnc: new VncClient({

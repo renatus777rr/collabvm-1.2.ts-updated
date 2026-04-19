@@ -1,13 +1,13 @@
 import { Size, Rect } from "../Utilities";
 
 export function BatchRects(size: Size, rects: Array<Rect>): Rect {
-	var mergedX = size.width;
-	var mergedY = size.height;
-	var mergedHeight = 0;
-	var mergedWidth = 0;
+	let mergedX = size.width;
+	let mergedY = size.height;
+	let mergedHeight = 0;
+	let mergedWidth = 0;
 
 	// can't batch these
-	if (rects.length == 0) {
+	if (rects.length === 0) {
 		return {
 			x: 0,
 			y: 0,
@@ -16,8 +16,8 @@ export function BatchRects(size: Size, rects: Array<Rect>): Rect {
 		};
 	}
 
-	if (rects.length == 1) {
-		if (rects[0].width == size.width && rects[0].height == size.height) {
+	if (rects.length === 1) {
+		if (rects[0].width === size.width && rects[0].height === size.height) {
 			return rects[0];
 		}
 	}
