@@ -1,10 +1,11 @@
 import IConfig from './IConfig.js';
 import * as Utilities from './Utilities.js';
 import { User, Rank } from './User.js';
+// I hate that you have to do it like this
 import CircularBuffer from 'mnemonist/circular-buffer.js';
 import Queue from 'mnemonist/queue.js';
 import { createHash } from 'crypto';
-import { VMState } from '@computernewb/superqemu';
+import { VMState, QemuVM, QemuVmDefinition } from '@computernewb/superqemu';
 import { IPDataManager } from './IPData.js';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -12,516 +13,1046 @@ import AuthManager from './AuthManager.js';
 import { JPEGEncoder } from './JPEGEncoder.js';
 import VM from './vm/interface.js';
 import { ReaderModel } from '@maxmind/geoip2-node';
+
 import { Size, Rect } from './Utilities.js';
 import pino from 'pino';
 import { BanManager } from './BanManager.js';
 import { TheAuditLog } from './AuditLog.js';
-import { 
-  IProtocolMessageHandler, 
-  ListEntry, 
-  ProtocolAddUser, 
-  ProtocolFlag, 
-  ProtocolRenameStatus, 
-  ProtocolUpgradeCapability 
-} from './protocol/Protocol.js';
+import { IProtocolMessageHandler, ListEntry, ProtocolAddUser, ProtocolFlag, ProtocolRenameStatus, ProtocolUpgradeCapability } from './protocol/Protocol.js';
 import { TheProtocolManager } from './protocol/Manager.js';
 
+// Instead of strange hacks we can just use nodejs provided
+// import.meta properties, which have existed since LTS if not before
 const __dirname = import.meta.dirname;
+
 const kCVMTSAssetsRoot = path.resolve(__dirname, '../../assets');
+
 const kRestartTimeout = 5000;
 
-interface ChatHistoryEntry { user: string; msg: string; }
-interface VoteTally { yes: number; no: number; }
-interface VoteState { inProgress: boolean; timeLeft: number; cooldown: number; interval?: NodeJS.Timeout; }
-interface TurnStateData { 
-  queue: Queue<User>; 
-  timeLeft: number; 
-  interval?: NodeJS.Timeout; 
-  currentUser: User | null; 
-  indefiniteUser: User | null; 
-}
+type ChatHistory = {
+	user: string;
+	msg: string;
+};
+
+type VoteTally = {
+	yes: number;
+	no: number;
+};
 
 export default class CollabVMServer implements IProtocolMessageHandler {
-  private readonly config: IConfig;
-  private readonly logger = pino({ name: 'CVMTS.Server', level: process.env.LOG_LEVEL || 'info' });
-  private readonly clients = new Map<string, User>();
-  private readonly clientByName = new Map<string, User>();
-  private readonly connectedClients = new Set<User>();
-  private readonly adminClients = new Set<User>();
-  
-  private chatHistory: CircularBuffer<ChatHistoryEntry>;
-  private turnState: TurnStateData;
-  private voteState: VoteState;
-  private vm: VM;
-  private displaySize: Size = { width: 0, height: 0 };
-  private rectQueue: Rect[] = [];
-  private readonly screenHiddenImg: Buffer;
-  private readonly screenHiddenThumb: Buffer;
-  private readonly modPerms: number;
-  private screenHidden = false;
-  private turnsAllowed = true;
+	private Config: IConfig;
 
-  constructor(
-    config: IConfig, 
-    vm: VM, 
-    private readonly banmgr: BanManager,
-    auth: AuthManager | null = null, 
-    geoipReader: ReaderModel | null = null
-  ) {
-    this.config = config;
-    this.chatHistory = new CircularBuffer<ChatHistoryEntry>(Array, config.collabvm.maxChatHistoryLength);
-    this.turnState = { queue: new Queue<User>(), timeLeft: 0, currentUser: null, indefiniteUser: null };
-    this.voteState = { inProgress: false, timeLeft: 0, cooldown: 0 };
-    
-    this.screenHiddenImg = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhidden.jpeg'));
-    this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
-    this.modPerms = Utilities.MakeModPerms(config.collabvm.moderatorPermissions);
-    
-    this.vm = vm;
-    this.setupVMHandlers();
-    this.auth = auth;
-    this.geoipReader = geoipReader;
-  }
+	private clients: User[];
 
-  private setupVMHandlers() {
-    this.vm.Events().on('statechange', (newState: VMState) => {
-      if (newState === VMState.Started) {
-        this.vm.StartDisplay();
-        const display = this.vm.GetDisplay();
-        display?.on('resize', (size: Size) => this.onDisplayResize(size));
-        display?.on('rect', (rect: Rect) => this.rectQueue.push(rect));
-        display?.on('frame', () => this.processFrame());
-      } else if (newState === VMState.Stopped) {
-        setTimeout(() => this.vm.Start(), kRestartTimeout);
-      }
-    });
-  }
+	private ChatHistory: CircularBuffer<ChatHistory>;
 
-  /** Core Connection Flow */
-  connectionOpened(user: User): void {
-    if (this.getClientsByIP(user.IP.address).length >= this.config.collabvm.maxConnections) {
-      this.getClientsByIP(user.IP.address)[0]?.kick();
-    }
+	private TurnQueue: Queue<User>;
 
-    this.clients.set(user.IP.address, user);
-    this.connectedClients.add(user);
-    this.resolveGeoIP(user);
-    this.setupUserHandlers(user);
-    this.sendInitialData(user);
-  }
+	// Time remaining on the current turn
+	private TurnTime: number;
 
-  private connectionClosed(user: User): void {
-    this.clients.delete(user.IP.address);
-    this.clientByName.delete(user.username ?? '');
-    this.connectedClients.delete(user);
-    this.adminClients.delete(user);
-    this.cleanupUserState(user);
-    this.broadcastUserRemoval(user.username ?? '');
-  }
+	// Interval to keep track of the current turn time
+	private TurnInterval?: NodeJS.Timeout;
 
-  private setupUserHandlers(user: User) {
-    user.socket.on('msg', (buf: Buffer) => {
-      try {
-        user.processMessage(this, buf);
-      } catch {
-        user.kick();
-      }
-    });
-    user.socket.on('disconnect', () => this.connectionClosed(user));
-  }
+	// If a reset vote is in progress
+	private voteInProgress: boolean;
 
-  /** Optimized Operations */
-  private getClientsByIP(ip: string): User[] {
-    return Array.from(this.clients.values()).filter(c => c.IP.address === ip);
-  }
+	// Interval to keep track of vote resets
+	private voteInterval?: NodeJS.Timeout;
 
-  private broadcastChat(username: string, message: string): void {
-    this.connectedClients.forEach(c => c.sendChatMessage(username, message));
-    if (message.trim()) {
-      this.chatHistory.push({ user: username, msg: Utilities.HTMLSanitize(message).slice(0, this.config.collabvm.maxChatLength) });
-    }
-  }
+	// How much time is left on the vote
+	private voteTime: number;
 
-  private sendTurnUpdate(): void {
-    const users = this.turnState.queue.toArray().map(u => u.username!);
-    const turnTime = this.turnState.indefiniteUser ? 9999999999 : this.turnState.timeLeft * 1000;
-    
-    this.connectedClients.forEach(client => {
-      if (client.connectedToNode) {
-        const pos = this.turnState.queue.toArray().indexOf(client);
-        if (pos > 0) {
-          client.sendTurnQueueWaiting(turnTime, users, (pos - 1) * this.config.collabvm.turnTime * 1000);
-        } else {
-          client.sendTurnQueue(turnTime, users);
-        }
-      }
-    });
-  }
+	// How much time until another reset vote can be cast
+	private voteCooldown: number;
 
-  /** Turn System */
-  onTurnRequest(user: User, forfeit: boolean): void {
-    if (!this.canTakeTurn(user)) return;
-    
-    if (forfeit) {
-      this.endTurn(user);
-    } else if (!this.turnState.queue.toArray().includes(user)) {
-      if (this.checkTurnLimit(user)) {
-        this.turnState.queue.enqueue(user);
-        if (this.turnState.queue.size === 1) this.nextTurn();
-      }
-    }
-    this.sendTurnUpdate();
-  }
+	// Interval to keep track
+	private voteCooldownInterval?: NodeJS.Timeout;
 
-  private canTakeTurn(user: User): boolean {
-    return (this.turnsAllowed || this.hasTurnPrivileges(user)) && 
-           user.connectedToNode && 
-           user.TurnRateLimit.request() && 
-           this.authCheck(user, this.config.auth.guestPermissions.turn) &&
-           !user.IP.muted;
-  }
+	// Completely disable turns
+	private turnsAllowed: boolean;
 
-  private checkTurnLimit(user: User): boolean {
-    if (!this.config.collabvm.turnlimit.enabled) return true;
-    const ipCount = this.turnState.queue.toArray().filter(u => u.IP.address === user.IP.address).length;
-    return ipCount < this.config.collabvm.turnlimit.maximum;
-  }
+	// Hide the screen
+	private screenHidden: boolean;
 
-  private hasTurnPrivileges(user: User): boolean {
-    return user.rank >= Rank.Moderator || user.turnWhitelist;
-  }
+	// base64 image to show when the screen is hidden
+	private screenHiddenImg: Buffer;
+	private screenHiddenThumb: Buffer;
 
-  private nextTurn(): void {
-    this.clearTurnInterval();
-    if (this.turnState.queue.size === 0) return;
+	// Indefinite turn
+	private indefiniteTurn: User | null;
+	private ModPerms: number;
+	private VM: VM;
 
-    this.turnState.timeLeft = this.config.collabvm.turnTime;
-    this.turnState.currentUser = this.turnState.queue.peek()!;
-    this.turnState.interval = setInterval(() => {
-      if (!this.turnState.indefiniteUser && --this.turnState.timeLeft < 1) {
-        this.turnState.queue.dequeue();
-        this.nextTurn();
-      }
-    }, 1000);
-    this.sendTurnUpdate();
-  }
+	// Authentication manager
+	private auth: AuthManager | null;
 
-  private endTurn(user: User): void {
-    if (this.turnState.indefiniteUser === user) this.turnState.indefiniteUser = null;
-    this.removeFromTurnQueue(user);
-    this.sendTurnUpdate();
-  }
+	// Geoip
+	private geoipReader: ReaderModel | null;
 
-  private removeFromTurnQueue(user: User): void {
-    const wasCurrent = this.turnState.currentUser === user;
-    this.turnState.queue = new Queue(this.turnState.queue.toArray().filter(u => u !== user));
-    this.turnState.currentUser = this.turnState.queue.peek() || null;
-    if (wasCurrent) this.nextTurn();
-  }
+	// Ban manager
+	private banmgr: BanManager;
 
-  private clearTurnInterval(): void {
-    this.turnState.interval && clearInterval(this.turnState.interval);
-    this.turnState.interval = undefined;
-  }
+	// queue of rects, reset every frame
+	private rectQueue: Rect[] = [];
 
-  /** Vote System */
-  onVote(user: User, choice: number): void {
-    if (choice === 1 && !this.voteState.inProgress) {
-      if (this.voteState.cooldown > 0 || !this.authCheck(user, this.config.auth.guestPermissions.callForReset)) {
-        user.sendVoteCooldown(this.voteState.cooldown);
-        return;
-      }
-      this.startVote();
-      this.broadcastChat('', `${user.username} has started a vote to reset the VM.`);
-    }
+	private logger = pino({ name: 'CVMTS.Server' });
 
-    if (!this.canVote(user)) return;
+	constructor(config: IConfig, vm: VM, banmgr: BanManager, auth: AuthManager | null, geoipReader: ReaderModel | null) {
+		this.Config = config;
+		this.ChatHistory = new CircularBuffer<ChatHistory>(Array, this.Config.collabvm.maxChatHistoryLength);
+		this.TurnQueue = new Queue<User>();
+		this.TurnTime = 0;
+		this.clients = [];
+		this.voteInProgress = false;
+		this.voteTime = 0;
+		this.voteCooldown = 0;
+		this.turnsAllowed = true;
+		this.screenHidden = false;
+		this.screenHiddenImg = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhidden.jpeg'));
+		this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
 
-    const voteValue = choice === 1;
-    if (user.IP.vote !== voteValue) {
-      this.broadcastChat('', `${user.username} has voted ${voteValue ? 'yes' : 'no'}.`);
-    }
-    user.IP.vote = voteValue;
-    this.sendVoteUpdate();
-  }
+		this.indefiniteTurn = null;
+		this.ModPerms = Utilities.MakeModPerms(this.Config.collabvm.moderatorPermissions);
 
-  private canVote(user: User): boolean {
-    return this.vm.SnapshotsSupported() && 
-           user.connectedToNode && 
-           user.VoteRateLimit.request() && 
-           this.authCheck(user, this.config.auth.guestPermissions.vote);
-  }
+		// No size initially, since there usually won't be a display connected at all during initalization
+		this.OnDisplayResized({
+			width: 0,
+			height: 0
+		});
 
-  private startVote(): void {
-    this.voteState.inProgress = true;
-    this.voteState.timeLeft = this.config.collabvm.voteTime;
-    this.voteState.interval = setInterval(() => {
-      if (--this.voteState.timeLeft < 1) this.endVote();
-    }, 1000);
-  }
+		this.VM = vm;
 
-  private endVote(): void {
-    this.voteState.inProgress = false;
-    clearInterval(this.voteState.interval!);
-    
-    const { yes, no } = this.getVoteCounts();
-    const votePassed = yes >= no;
-    
-    this.broadcast((c) => c.sendVoteEnded(), null);
-    this.broadcastChat('', `The vote to reset the VM has ${votePassed ? 'won' : 'lost'}.`);
-    
-    if (votePassed) this.vm.Reset();
-    
-    IPDataManager.ForEachIPData(ip => { ip.vote = null; });
-    this.voteState.cooldown = this.config.collabvm.voteCooldown;
-    
-    const cooldownInt = setInterval(() => {
-      if (--this.voteState.cooldown < 1) clearInterval(cooldownInt);
-    }, 1000);
-  }
+		let self = this;
 
-  private sendVoteUpdate(): void {
-    if (!this.voteState.inProgress) return;
-    const { yes, no } = this.getVoteCounts();
-    this.connectedClients.forEach(c => c.sendVoteStats(this.voteState.timeLeft * 1000, yes, no));
-  }
+		vm.Events().on('statechange', (newState: VMState) => {
+			if (newState == VMState.Started) {
+				self.logger.info('VM started');
 
-  private getVoteCounts(): VoteTally {
-    let yes = 0, no = 0;
-    IPDataManager.ForEachIPData(ip => {
-      if (ip.vote === true) yes++;
-      if (ip.vote === false) no++;
-    });
-    return { yes, no };
-  }
+				// start the display and add the events once
+				if (self.VM.GetDisplay() == null) {
+					self.VM.StartDisplay();
 
-  /** Input Handling */
-  onKey(user: User, keysym: number, pressed: boolean): void {
-    if (this.turnState.currentUser !== user && user.rank !== Rank.Admin) return;
-    this.vm.GetDisplay()?.KeyboardEvent(keysym, pressed);
-  }
+					self.logger.info('started display, adding events now');
 
-  onMouse(user: User, x: number, y: number, buttonMask: number): void {
-    if (this.turnState.currentUser !== user && user.rank !== Rank.Admin) return;
-    this.vm.GetDisplay()?.MouseEvent(x, y, buttonMask);
-  }
+					// add events
+					self.VM.GetDisplay()?.on('resize', (size: Size) => self.OnDisplayResized(size));
+					self.VM.GetDisplay()?.on('rect', (rect: Rect) => self.OnDisplayRectangle(rect));
+					self.VM.GetDisplay()?.on('frame', () => self.OnDisplayFrame());
+				}
+			}
 
-  /** Display System */
-  private onDisplayResize(size: Size): void {
-    this.displaySize = size;
-    this.connectedClients.forEach(c => {
-      if (!this.screenHidden || c.rank !== Rank.Unregistered) {
-        c.sendScreenResize(size.width, size.height);
-      }
-    });
-  }
+			if (newState == VMState.Stopped) {
+				setTimeout(async () => {
+					self.logger.info('restarting VM');
+					await self.VM.Start();
+				}, kRestartTimeout);
+			}
+		});
 
-  private async processFrame(): Promise<void> {
-    if (this.rectQueue.length === 0) return;
-    
-    const rects = this.rectQueue.splice(0);
-    const promises = rects.map(rect => this.encodeAndBroadcastRect(rect));
-    await Promise.all(promises);
-  }
+		// authentication manager
+		this.auth = auth;
 
-  private async encodeAndBroadcastRect(rect: Rect): Promise<void> {
-    const encoded = await this.encodeRect(rect);
-    this.connectedClients.forEach(c => {
-      if (!this.screenHidden || c.rank !== Rank.Unregistered) {
-        c.sendScreenUpdate({ x: rect.x, y: rect.y, data: encoded });
-      }
-    });
-  }
+		this.geoipReader = geoipReader;
 
-  private async encodeRect(rect: Rect): Promise<Buffer> {
-    const display = this.vm.GetDisplay();
-    return display?.Connected() ? 
-      JPEGEncoder.Encode(display.Buffer()!, display.Size(), rect) : 
-      Buffer.alloc(0);
-  }
+		this.banmgr = banmgr;
+	}
 
-  /** Protocol Handlers - Cleaned Up */
-  onNop(user: User): void { user.onNop(); }
+	public connectionOpened(user: User) {
+		let sameip = this.clients.filter((c) => c.IP.address === user.IP.address);
+		if (sameip.length >= this.Config.collabvm.maxConnections) {
+			// Kick the oldest client
+			// I think this is a better solution than just rejecting the connection
+			sameip[0].kick();
+		}
+		this.clients.push(user);
 
-  onNoFlag(user: User): void { if (!user.connectedToNode) user.noFlag = true; }
+		if (this.Config.geoip.enabled) {
+			try {
+				user.countryCode = this.geoipReader!.country(user.IP.address).country!.isoCode;
+				user.logger.info({event: "geoip/resolved", geoip: user.countryCode});
+			} catch (error) {
+				user.logger.warn({event: "geoip/unresolved", msg: `${(error as Error)}`});
+			}
+		}
 
-  onCapabilityUpgrade(user: User, capabilities: string[]): boolean {
-    if (user.connectedToNode) return false;
-    
-    const enabled: ProtocolUpgradeCapability[] = [];
-    for (const cap of capabilities) {
-      if (cap === ProtocolUpgradeCapability.BinRects) {
-        enabled.push(cap as ProtocolUpgradeCapability);
-        user.Capabilities.bin = true;
-        user.protocol = TheProtocolManager.getProtocol('binary1');
-      }
-    }
-    user.sendCapabilities(enabled);
-    return true;
-  }
+		user.socket.on('msg', (buf: Buffer, binary: boolean) => {
+			try {
+				user.processMessage(this, buf);
+			} catch (err) {
+				user.logger.error({
+					event: "msg/general error",
+					error_message: (err as Error).message
+				}, 'Error in %s#processMessage.', Object.getPrototypeOf(user.protocol).constructor?.name);
+				user.kick();
+			}
+		});
 
-  onChat(user: User, message: string): void {
-    if (!user.username || user.IP.muted || !this.authCheck(user, this.config.auth.guestPermissions.chat)) return;
-    
-    const cleanMsg = Utilities.HTMLSanitize(message).slice(0, this.config.collabvm.maxChatLength).trim();
-    if (!cleanMsg) return;
-    
-    this.broadcastChat(user.username!, cleanMsg);
-    user.onChatMsgSent();
-  }
+		user.socket.on('disconnect', () => this.connectionClosed(user));
 
-  onRename(user: User, newName?: string): void {
-    if (!user.RenameRateLimit.request() || (user.connectedToNode && user.IP.muted)) return;
-    if (this.config.auth.enabled && user.rank !== Rank.Unregistered) return;
-    
-    this.renameUser(user, newName);
-  }
+		if (this.Config.auth.enabled) {
+			user.sendAuth(this.Config.auth.apiEndpoint);
+		}
 
-  private renameUser(user: User, newName?: string, announce = true): void {
-    const oldName = user.username;
-    let status = ProtocolRenameStatus.Ok;
+		user.sendAddUser(this.getAddUser());
+		if (this.Config.geoip.enabled) {
+			let flags = this.getFlags();
+			user.sendFlag(flags);
+		}
+	}
 
-    if (!newName) {
-      user.assignGuestName(Array.from(this.clientByName.keys()));
-    } else {
-      newName = newName.trim();
-      if (this.clientByName.has(newName) || 
-          !/^[a-zA-Z0-9\s\-_\.]{3,20}$/.test(newName) || 
-          this.config.collabvm.usernameblacklist.includes(newName)) {
-        user.assignGuestName(Array.from(this.clientByName.keys()));
-        status = ProtocolRenameStatus.UsernameInvalid;
-      } else {
-        user.username = newName;
-      }
-    }
+	private connectionClosed(user: User) {
+		let clientIndex = this.clients.indexOf(user);
+		if (clientIndex === -1) return;
 
-    this.clientByName.set(user.username!, user);
-    if (oldName) this.clientByName.delete(oldName);
+		if (user.IP.vote != null) {
+			user.IP.vote = null;
+			this.sendVoteUpdate();
+		}
 
-    user.sendSelfRename(status, user.username!, user.rank);
-    
-    if (announce) {
-      if (oldName) {
-        this.connectedClients.forEach(c => c.sendRename(oldName, user.username!, user.rank));
-      } else {
-        this.broadcastUserUpdate(user);
-      }
-    }
-  }
+		if (this.indefiniteTurn === user) this.indefiniteTurn = null;
 
-  private broadcastUserUpdate(user: User): void {
-    const addUser: ProtocolAddUser = { username: user.username!, rank: user.rank };
-    const flag: ProtocolFlag = user.countryCode ? { username: user.username!, countryCode: user.countryCode } : undefined;
-    
-    this.connectedClients.forEach(c => {
-      c.sendAddUser([addUser]);
-      if (flag) c.sendFlag([flag]);
-    });
-  }
+		this.clients.splice(clientIndex, 1);
 
-  private broadcastUserRemoval(username: string): void {
-    if (username) {
-      this.connectedClients.forEach(c => c.sendRemUser([username]));
-    }
-  }
+		user.logger.info({event: "user/disconnect"});
+		if (!user.username) return;
+		if (this.TurnQueue.toArray().indexOf(user) !== -1) {
+			var hadturn = this.TurnQueue.peek() === user;
+			this.TurnQueue = Queue.from(this.TurnQueue.toArray().filter((u) => u !== user));
+			if (hadturn) this.nextTurn();
+		}
 
-  /** Admin Commands - Simplified */
-  async onAdminLogin(user: User, password: string): Promise<void> {
-    if (!user.LoginRateLimit.request() || !user.username) return;
-    
-    const pwdHash = createHash('sha256').update(password, 'utf-8').digest('hex');
-    
-    if (pwdHash === this.config.collabvm.adminpass) {
-      user.rank = Rank.Admin;
-      this.adminClients.add(user);
-    } else if (this.config.collabvm.moderatorEnabled && pwdHash === this.config.collabvm.modpass) {
-      user.rank = Rank.Moderator;
-    } else if (this.config.collabvm.turnwhitelist && pwdHash === this.config.collabvm.turnpass) {
-      user.turnWhitelist = true;
-      user.sendChatMessage('', 'You may now take turns.');
-      return;
-    } else {
-      user.sendAdminLoginResponse(false, undefined);
-      return;
-    }
+		this.clients.forEach((c) => c.sendRemUser([user.username!]));
+	}
 
-    user.sendAdminLoginResponse(true, user.rank === Rank.Admin ? undefined : this.modPerms);
-    this.broadcastUserUpdate(user);
-  }
+	// Protocol message handlers
 
-  onAdminKickUser(user: User, targetName: string): void {
-    if (!this.hasPermission(user, 'kick')) return;
-    const target = this.clientByName.get(targetName);
-    if (target) {
-      TheAuditLog.onKick(user, target);
-      target.kick();
-    }
-  }
+	// does auth check
+	private authCheck(user: User, guestPermission: boolean) {
+		if (!this.Config.auth.enabled) return true;
 
-  onAdminEndTurn(user: User, targetName: string): void {
-    if (!this.hasPermission(user, 'bypassturn')) return;
-    const target = this.clientByName.get(targetName);
-    if (target) this.endTurn(target);
-  }
+		if (user.rank === Rank.Unregistered && !guestPermission) {
+			user.sendChatMessage('', 'You need to login to do that.');
+			return false;
+		}
 
-  private hasPermission(user: User, permission: string): boolean {
-    return user.rank === Rank.Admin || 
-           (user.rank === Rank.Moderator && this.config.collabvm.moderatorPermissions[permission]);
-  }
+		return true;
+	}
 
-  /** Utility Methods */
-  private authCheck(user: User, guestPermission: boolean): boolean {
-    return !this.config.auth?.enabled || 
-           (user.rank !== Rank.Unregistered || guestPermission);
-  }
+	onNop(user: User): void {
+		user.onNop();
+	}
 
-  private resolveGeoIP(user: User): void {
-    if (!this.config.geoip.enabled || !this.geoipReader) return;
-    try {
-      user.countryCode = this.geoipReader.country(user.IP.address).country?.isoCode ?? null;
-    } catch {}
-  }
+	async onLogin(user: User, token: string) {
+		if (!this.Config.auth.enabled) return;
 
-  private sendInitialData(user: User): void {
-    if (this.config.auth?.enabled) user.sendAuth(this.config.auth.apiEndpoint);
-    user.sendAddUser(this.getUserList());
-    if (this.config.geoip.enabled) user.sendFlag(this.getFlags());
-    
-    if (this.chatHistory.size) {
-      user.sendChatHistoryMessage(this.chatHistory.toArray() as ChatHistoryEntry[]);
-    }
-    if (this.config.collabvm.motd) {
-      user.sendChatMessage('', this.config.collabvm.motd);
-    }
-  }
+		if (!user.connectedToNode) {
+			user.sendLoginResponse(false, 'You must connect to the VM before logging in.');
+			return;
+		}
 
-  private getUserList(): ProtocolAddUser[] {
-    return Array.from(this.clientByName.values()).map(u => ({
-      username: u.username!,
-      rank: u.rank
-    }));
-  }
+		try {
+			let res = await this.auth!.Authenticate(token, user);
 
-  private getFlags(): ProtocolFlag[] {
-    return Array.from(this.clientByName.values())
-      .filter(u => u.countryCode && (!u.noFlag || u.rank === Rank.Unregistered))
-      .map(u => ({ username: u.username!, countryCode: u.countryCode! }));
-  }
+			if (res.clientSuccess) {
+				user.logger.info({ event: "user/auth/login", username: res.username });
+				user.sendLoginResponse(true, '');
 
-  private sendInitialUserData(user: User) {
-    user.sendAddUser(this.getUserList());
-    if (this.config.geoip.enabled) user.sendFlag(this.getFlags());
-  }
+				let old = this.clients.find((c) => c.username === res.username);
+				if (old) {
+					// kick() doesnt wait until the user is actually removed from the list and itd be anal to make it do that
+					// so we call connectionClosed manually here. When it gets called on kick(), it will return because the user isn't in the list
+					this.connectionClosed(old);
+					await old.kick();
+				}
+				// Set username
+				if (user.countryCode !== null && user.noFlag) {
+					// privacy
+					for (let cl of this.clients.filter((c) => c !== user)) {
+						cl.sendRemUser([user.username!]);
+					}
+					this.renameUser(user, res.username, false);
+				} else this.renameUser(user, res.username, true);
+				// Set rank
+				user.rank = res.rank;
+				if (user.rank === Rank.Admin) {
+					user.sendAdminLoginResponse(true, undefined);
+				} else if (user.rank === Rank.Moderator) {
+					user.sendAdminLoginResponse(true, this.ModPerms);
+				}
+				this.clients.forEach((c) =>
+					c.sendAddUser([
+						{
+							username: user.username!,
+							rank: user.rank
+						}
+					])
+				);
+			} else {
+				user.sendLoginResponse(false, res.error!);
+				if (res.error === 'You are banned') {
+					user.kick();
+				}
+			}
+		} catch (err) {
+			this.logger.error({event: "user/auth/internal error", msg: `${(err as Error).message}`});
 
-  private cleanupUserState(user: User): void {
-    if (user.IP.vote !== null) {
-      user.IP.vote = null;
-      this.sendVoteUpdate();
-    }
-    if (this.turnState.queue.toArray().includes(user) || this.turnState.currentUser === user) {
-      this.removeFromTurnQueue(user);
-    }
-  }
+			user.sendLoginResponse(false, 'There was an internal error while authenticating. Please let a staff member know as soon as possible');
+		}
+	}
 
-  // Remaining protocol handlers follow the same clean pattern...
+	onNoFlag(user: User) {
+		// Too late
+		if (user.connectedToNode) return;
+		user.noFlag = true;
+	}
+
+	onCapabilityUpgrade(user: User, capability: String[]): boolean {
+		if (user.connectedToNode) return false;
+
+		let enabledCaps = [];
+
+		for (let cap of capability) {
+			switch (cap) {
+				// binary 1.0 (msgpack rects)
+				case ProtocolUpgradeCapability.BinRects:
+					enabledCaps.push(cap as ProtocolUpgradeCapability);
+					user.Capabilities.bin = true;
+					user.protocol = TheProtocolManager.getProtocol('binary1');
+					break;
+				default:
+					break;
+			}
+		}
+
+		user.sendCapabilities(enabledCaps);
+		return true;
+	}
+
+	onTurnRequest(user: User, forfeit: boolean): void {
+		user.logger.trace({event: "turn/requested"});
+		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
+
+		if (!this.authCheck(user, this.Config.auth.guestPermissions.turn)) return;
+
+		if (!user.TurnRateLimit.request()) {
+			user.logger.warn({event: "turn/ratelimited"});
+			return;
+		}
+		if (!user.connectedToNode) {
+			user.logger.warn({event: "turn/requested when not in queue"})
+			return;
+		}
+
+		if (forfeit == false) {
+			var currentQueue = this.TurnQueue.toArray();
+			// If the user is already in the turn queue, ignore the turn request.
+			if (currentQueue.indexOf(user) !== -1) return;
+			// If they're muted, also ignore the turn request.
+			// Send them the turn queue to prevent client glitches
+			if (user.IP.muted) return;
+			if (this.Config.collabvm.turnlimit.enabled) {
+				// Get the amount of users in the turn queue with the same IP as the user requesting a turn.
+				let turns = currentQueue.filter((otheruser) => otheruser.IP.address == user.IP.address);
+				// If it exceeds the limit set in the config, ignore the turn request.
+				if (turns.length + 1 > this.Config.collabvm.turnlimit.maximum) {
+					user.logger.warn({event: "turn/ignoring request due to turn limit"});
+					return;
+				}
+			}
+			user.logger.info({event: "turn/entering queue"});
+			this.TurnQueue.enqueue(user);
+			if (this.TurnQueue.size === 1) this.nextTurn();
+		} else {
+			// Not sure why this wasn't using this before
+			this.endTurn(user);
+		}
+		this.sendTurnUpdate();
+	}
+
+	onVote(user: User, choice: number): void {
+		if (!this.VM.SnapshotsSupported()) {
+			user.logger.warn({event: "vote/voted without snapshots enabled"});
+			return;
+		}
+		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
+		if (!user.connectedToNode) {
+			user.logger.warn({event: "vote/not connected to node"});
+			return;
+		}
+		if (!user.VoteRateLimit.request()) {
+			user.logger.warn({event: "vote/voted but was ratelimited"});
+			return;
+		}
+		switch (choice) {
+			case 1:
+				if (!this.voteInProgress) {
+					if (!this.authCheck(user, this.Config.auth.guestPermissions.callForReset)) return;
+
+					if (this.voteCooldown !== 0) {
+						user.sendVoteCooldown(this.voteCooldown);
+						return;
+					}
+
+					user.logger.info({event: "vote/user initiated a vote"});
+					this.startVote();
+					this.clients.forEach((c) => c.sendChatMessage('', `${user.username} has started a vote to reset the VM.`));
+				}
+
+				if (!this.authCheck(user, this.Config.auth.guestPermissions.vote)) return;
+
+				if (user.IP.vote !== true) {
+					this.clients.forEach((c) => c.sendChatMessage('', `${user.username} has voted yes.`));
+				}
+
+				user.logger.info({event: "vote/yes"});
+				user.IP.vote = true;
+				break;
+			case 0:
+				if (!this.voteInProgress) return;
+
+				if (!this.authCheck(user, this.Config.auth.guestPermissions.vote)) return;
+
+				if (user.IP.vote !== false) {
+					this.clients.forEach((c) => c.sendChatMessage('', `${user.username} has voted no.`));
+				}
+
+				user.logger.info({event: "vote/no"});
+				user.IP.vote = false;
+				break;
+			default:
+				break;
+		}
+		this.sendVoteUpdate();
+	}
+
+	async onList(user: User) {
+		let listEntry: ListEntry = {
+			id: this.Config.collabvm.node,
+			name: this.Config.collabvm.displayname,
+			thumbnail: this.screenHidden ? this.screenHiddenThumb : await this.getThumbnail()
+		};
+
+		if (this.VM.GetState() == VMState.Started) {
+			user.sendListResponse([listEntry]);
+		}
+	}
+
+	private async connectViewShared(user: User, node: string, viewMode: number | undefined) {
+		if (!user.username || node !== this.Config.collabvm.node) {
+			user.sendConnectFailResponse();
+			return;
+		}
+
+		user.connectedToNode = true;
+
+		if (viewMode !== undefined) {
+			if (viewMode !== 0 && viewMode !== 1) {
+				user.sendConnectFailResponse();
+				return;
+			}
+
+			user.viewMode = viewMode;
+		}
+
+		user.sendConnectOKResponse(this.VM.SnapshotsSupported());
+
+		if (this.ChatHistory.size !== 0) {
+			let history = this.ChatHistory.toArray() as ChatHistory[];
+			user.sendChatHistoryMessage(history);
+		}
+		if (this.Config.collabvm.motd) user.sendChatMessage('', this.Config.collabvm.motd);
+		if (this.screenHidden) {
+			user?.sendScreenResize(1024, 768);
+			user?.sendScreenUpdate({
+				x: 0,
+				y: 0,
+				data: this.screenHiddenImg
+			});
+		} else {
+			await this.SendFullScreenWithSize(user);
+		}
+
+		user.sendSync(Date.now());
+
+		if (this.voteInProgress) this.sendVoteUpdate(user);
+		this.sendTurnUpdate(user);
+	}
+
+	async onConnect(user: User, node: string) {
+		user.logger.info({event: "user/joined node", node});
+		return this.connectViewShared(user, node, undefined);
+	}
+
+	async onView(user: User, node: string, viewMode: number) {
+		user.logger.info({event: "user/entering view", node, viewMode});
+		return this.connectViewShared(user, node, viewMode);
+	}
+
+	onRename(user: User, newName: string | undefined): void {
+		if (!user.RenameRateLimit.request()) {
+			user.logger.warn({event: "rename/ratelimit"});
+			return;
+		}
+		if (user.connectedToNode && user.IP.muted) {
+			user.logger.warn({event: "rename/attempted to rename while muted"});
+			return;
+		}
+		if (this.Config.auth.enabled && user.rank !== Rank.Unregistered) {
+			user.sendChatMessage('', 'Go to your account settings to change your username.');
+			return;
+		}
+		if (this.Config.auth.enabled && newName !== undefined) {
+			// Don't send system message to a user without a username since it was likely an automated attempt by the webapp
+			if (user.username) user.sendChatMessage('', 'You need to log in to do that.');
+			if (user.rank !== Rank.Unregistered) return;
+			this.renameUser(user, undefined);
+			return;
+		}
+		this.renameUser(user, newName);
+	}
+
+	onChat(user: User, message: string): void {
+		if (!user.username) {
+			user.logger.warn({event: "chat/dropped message without username", message});
+			return;
+		}
+		if (user.IP.muted) return;
+		if (!this.authCheck(user, this.Config.auth.guestPermissions.chat)) return;
+
+		var msg = Utilities.HTMLSanitize(message);
+		// One of the things I hated most about the old server is it completely discarded your message if it was too long
+		if (msg.length > this.Config.collabvm.maxChatLength) msg = msg.substring(0, this.Config.collabvm.maxChatLength);
+		if (msg.trim().length < 1) return;
+
+		user.logger.info({event: "chat/message", msg});
+		this.clients.forEach((c) => c.sendChatMessage(user.username!, msg));
+		this.ChatHistory.push({ user: user.username, msg: msg });
+		user.onChatMsgSent();
+	}
+
+	onKey(user: User, keysym: number, pressed: boolean): void {
+		if (this.TurnQueue.peek() !== user && user.rank !== Rank.Admin) return;
+		user.logger.info({event: "key", keysym, pressed});
+		this.VM.GetDisplay()?.KeyboardEvent(keysym, pressed);
+	}
+
+	onMouse(user: User, x: number, y: number, buttonMask: number): void {
+		if (this.TurnQueue.peek() !== user && user.rank !== Rank.Admin) return;
+		this.VM.GetDisplay()?.MouseEvent(x, y, buttonMask);
+	}
+
+	async onAdminLogin(user: User, password: string) {
+		if (!user.LoginRateLimit.request() || !user.username) return;
+		var sha256 = createHash('sha256');
+		sha256.update(password, 'utf-8');
+		var pwdHash = sha256.digest('hex');
+		sha256.destroy();
+
+		if (this.Config.collabvm.turnwhitelist && pwdHash === this.Config.collabvm.turnpass) {
+			user.logger.info({event: "admin/granted turnpass"})
+			user.turnWhitelist = true;
+			user.sendChatMessage('', 'You may now take turns.');
+			return;
+		}
+
+		if (this.Config.auth.enabled) {
+			user.sendChatMessage('', 'This server does not support staff passwords. Please log in to become staff.');
+			return;
+		}
+
+		if (pwdHash === this.Config.collabvm.adminpass) {
+			user.logger.info({event: "admin/granted adminpass"})
+			user.rank = Rank.Admin;
+			user.sendAdminLoginResponse(true, undefined);
+		} else if (this.Config.collabvm.moderatorEnabled && pwdHash === this.Config.collabvm.modpass) {
+			user.logger.info({event: "admin/granted modpass"})
+			user.rank = Rank.Moderator;
+			user.sendAdminLoginResponse(true, this.ModPerms);
+		} else {
+			user.logger.warn({event: "admin/failed login attempt"})
+			user.sendAdminLoginResponse(false, undefined);
+			return;
+		}
+
+		if (this.screenHidden) {
+			await this.SendFullScreenWithSize(user);
+		}
+
+		// Update rank
+		this.clients.forEach((c) =>
+			c.sendAddUser([
+				{
+					username: user.username!,
+					rank: user.rank
+				}
+			])
+		);
+	}
+
+	async onAdminMonitor(user: User, node: string, command: string) {
+		if (user.rank !== Rank.Admin) return;
+		if (node !== this.Config.collabvm.node) return;
+		TheAuditLog.onMonitorCommand(user, command);
+		let output = await this.VM.MonitorCommand(command);
+		user.sendAdminMonitorResponse(String(output));
+	}
+
+	onAdminRestore(user: User, node: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.restore)) return;
+		TheAuditLog.onReset(user);
+		this.VM.Reset();
+	}
+
+	async onAdminReboot(user: User, node: string) {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.reboot)) return;
+		if (node !== this.Config.collabvm.node) return;
+		TheAuditLog.onReboot(user);
+		await this.VM.Reboot();
+	}
+
+	async onAdminBanUser(user: User, username: string) {
+		// Ban
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.ban)) return;
+		let target = this.clients.find((c) => c.username === username);
+		if (!target) return;
+		TheAuditLog.onBan(user, target);
+		await target.ban(this.banmgr);
+	}
+
+	onAdminForceVote(user: User, choice: number): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.forcevote)) return;
+		if (!this.voteInProgress) return;
+		this.endVote(choice == 1);
+	}
+
+	onAdminMuteUser(user: User, username: string, temporary: boolean): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.mute)) return;
+
+		let target = this.clients.find((c) => c.username === username);
+		if (!target) return;
+		target.mute(!temporary);
+	}
+
+	onAdminKickUser(user: User, username: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.kick)) return;
+		var target = this.clients.find((c) => c.username === username);
+		if (!target) return;
+		TheAuditLog.onKick(user, target);
+		target.kick();
+	}
+
+	onAdminEndTurn(user: User, username: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.bypassturn)) return;
+
+		var target = this.clients.find((c) => c.username === username);
+		if (!target) return;
+		this.endTurn(target);
+	}
+
+	onAdminClearQueue(user: User, node: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.bypassturn)) return;
+		if (node !== this.Config.collabvm.node) return;
+		this.clearTurns();
+	}
+
+	onAdminRename(user: User, target: string, newName: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.rename)) return;
+		if (this.Config.auth.enabled) {
+			user.sendChatMessage('', 'Cannot rename users on a server that uses authentication.');
+		}
+		var targetUser = this.clients.find((c) => c.username === target);
+		if (!targetUser) return;
+		this.renameUser(targetUser, newName);
+	}
+
+	onAdminGetIP(user: User, username: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.grabip)) return;
+		let target = this.clients.find((c) => c.username === username);
+		if (!target) return;
+		user.sendAdminIPResponse(username, target.IP.address);
+	}
+
+	onAdminBypassTurn(user: User): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.bypassturn)) return;
+		this.bypassTurn(user);
+	}
+
+	onAdminRawMessage(user: User, message: string): void {
+		if (user.rank !== Rank.Admin && (user.rank !== Rank.Moderator || !this.Config.collabvm.moderatorPermissions.xss)) return;
+		switch (user.rank) {
+			case Rank.Admin:
+				this.clients.forEach((c) => c.sendChatMessage(user.username!, message));
+
+				this.ChatHistory.push({ user: user.username!, msg: message });
+				break;
+			case Rank.Moderator:
+				this.clients.filter((c) => c.rank !== Rank.Admin).forEach((c) => c.sendChatMessage(user.username!, message));
+
+				this.clients.filter((c) => c.rank === Rank.Admin).forEach((c) => c.sendChatMessage(user.username!, Utilities.HTMLSanitize(message)));
+				break;
+		}
+	}
+
+	onAdminToggleTurns(user: User, enabled: boolean): void {
+		if (user.rank !== Rank.Admin) return;
+		if (enabled) {
+			this.turnsAllowed = true;
+		} else {
+			this.turnsAllowed = false;
+			this.clearTurns();
+		}
+	}
+
+	onAdminIndefiniteTurn(user: User): void {
+		if (user.rank !== Rank.Admin) return;
+		this.indefiniteTurn = user;
+		this.TurnQueue = Queue.from([user, ...this.TurnQueue.toArray().filter((c) => c !== user)]);
+		this.sendTurnUpdate();
+	}
+
+	async onAdminHideScreen(user: User, show: boolean) {
+		if (user.rank !== Rank.Admin) return;
+		if (show) {
+			// if(!this.screenHidden) return; ?
+
+			this.screenHidden = false;
+			let displaySize = this.VM.GetDisplay()?.Size();
+
+			if(displaySize == undefined)
+				return;
+
+			let encoded = await this.MakeRectData({
+				x: 0,
+				y: 0,
+				width: displaySize.width,
+				height: displaySize.height
+			});
+
+			this.clients.forEach(async (client) => this.SendFullScreenWithSize(client));
+		} else {
+			this.screenHidden = true;
+			this.clients
+				.filter((c) => c.rank == Rank.Unregistered)
+				.forEach((client) => {
+					client.sendScreenResize(1024, 768);
+					client.sendScreenUpdate({
+						x: 0,
+						y: 0,
+						data: this.screenHiddenImg
+					});
+				});
+		}
+	}
+
+	onAdminSystemMessage(user: User, message: string): void {
+		if (user.rank !== Rank.Admin) return;
+		this.clients.forEach((c) => c.sendChatMessage('', message));
+	}
+
+	// end protocol message handlers
+
+	getUsernameList(): string[] {
+		var arr: string[] = [];
+		this.clients.filter((c) => c.username).forEach((c) => arr.push(c.username!));
+		return arr;
+	}
+
+	renameUser(client: User, newName?: string, announce: boolean = true) {
+		// This shouldn't need a ternary but it does for some reason
+		let hadName = client.username ? true : false;
+		let oldname: any;
+		if (hadName) oldname = client.username;
+
+		let status = ProtocolRenameStatus.Ok;
+
+		if (!newName) {
+			client.assignGuestName(this.getUsernameList());
+		} else {
+			newName = newName.trim();
+			if (hadName && newName === oldname) {
+				client.sendSelfRename(ProtocolRenameStatus.Ok, client.username!, client.rank);
+				return;
+			}
+
+			if (this.getUsernameList().indexOf(newName) !== -1) {
+				client.assignGuestName(this.getUsernameList());
+				if (client.connectedToNode) {
+					status = ProtocolRenameStatus.UsernameTaken;
+				}
+			} else if (!/^[a-zA-Z0-9\ \-\_\.]+$/.test(newName) || newName.length > 20 || newName.length < 3) {
+				client.assignGuestName(this.getUsernameList());
+				status = ProtocolRenameStatus.UsernameInvalid;
+			} else if (this.Config.collabvm.usernameblacklist.indexOf(newName) !== -1) {
+				client.assignGuestName(this.getUsernameList());
+				status = ProtocolRenameStatus.UsernameNotAllowed;
+			} else client.username = newName;
+		}
+
+		client.sendSelfRename(status, client.username!, client.rank);
+
+		if (hadName) {
+			client.logger.info({event: "rename", from: oldname, to: client.username});
+			if (announce) this.clients.forEach((c) => c.sendRename(oldname, client.username!, client.rank));
+		} else {
+			client.logger.info({event: "rename", to: client.username});
+			if (announce)
+				this.clients.forEach((c) => {
+					c.sendAddUser([
+						{
+							username: client.username!,
+							rank: client.rank
+						}
+					]);
+
+					if (client.countryCode !== null) {
+						c.sendFlag([
+							{
+								username: client.username!,
+								countryCode: client.countryCode
+							}
+						]);
+					}
+				});
+		}
+	}
+
+	private getAddUser(): ProtocolAddUser[] {
+		return this.clients
+			.filter((c) => c.username)
+			.map((c) => {
+				return {
+					username: c.username!,
+					rank: c.rank
+				};
+			});
+	}
+
+	private getFlags(): ProtocolFlag[] {
+		let arr = [];
+		for (let c of this.clients.filter((cl) => cl.countryCode !== null && cl.username && (!cl.noFlag || cl.rank === Rank.Unregistered))) {
+			arr.push({
+				username: c.username!,
+				countryCode: c.countryCode!
+			});
+		}
+		return arr;
+	}
+
+	private sendTurnUpdate(client?: User) {
+		var turnQueueArr = this.TurnQueue.toArray();
+		var turntime: number;
+		if (this.indefiniteTurn === null) turntime = this.TurnTime * 1000;
+		else turntime = 9999999999;
+		var users: string[] = [];
+
+		this.TurnQueue.forEach((c) => users.push(c.username!));
+
+		var currentTurningUser = this.TurnQueue.peek();
+
+		if (client) {
+			client.sendTurnQueue(turntime, users);
+			return;
+		}
+
+		this.clients
+			.filter((c) => c !== currentTurningUser && c.connectedToNode)
+			.forEach((c) => {
+				if (turnQueueArr.indexOf(c) !== -1) {
+					var time;
+					if (this.indefiniteTurn === null) time = this.TurnTime * 1000 + (turnQueueArr.indexOf(c) - 1) * this.Config.collabvm.turnTime * 1000;
+					else time = 9999999999;
+					c.sendTurnQueueWaiting(turntime, users, time);
+				} else {
+					c.sendTurnQueue(turntime, users);
+				}
+			});
+		if (currentTurningUser) {
+			currentTurningUser.logger.info({event: "turn/held"});
+			currentTurningUser.sendTurnQueue(turntime, users);
+		}
+	}
+
+	private nextTurn() {
+		clearInterval(this.TurnInterval);
+		if (this.TurnQueue.size === 0) {
+		} else {
+			this.TurnTime = this.Config.collabvm.turnTime;
+			this.TurnInterval = setInterval(() => this.turnInterval(), 1000);
+		}
+		this.sendTurnUpdate();
+	}
+
+	clearTurns() {
+		this.logger.info({event: "turn/clearing turn queue"});
+		clearInterval(this.TurnInterval);
+		this.TurnQueue.clear();
+		this.sendTurnUpdate();
+	}
+
+	bypassTurn(client: User) {
+		client.logger.info({event: "turn/bypassing"});
+		var a = this.TurnQueue.toArray().filter((c) => c !== client);
+		this.TurnQueue = Queue.from([client, ...a]);
+		this.nextTurn();
+	}
+
+	endTurn(client: User) {
+		client.logger.info({event: "turn/ending"});
+		// I must have somehow accidentally removed this while scalpaling everything out
+		if (this.indefiniteTurn === client) this.indefiniteTurn = null;
+		var hasTurn = this.TurnQueue.peek() === client;
+		this.TurnQueue = Queue.from(this.TurnQueue.toArray().filter((c) => c !== client));
+		if (hasTurn) this.nextTurn();
+		else this.sendTurnUpdate();
+	}
+
+	private turnInterval() {
+		if (this.indefiniteTurn !== null) return;
+		this.TurnTime--;
+		if (this.TurnTime < 1) {
+			this.TurnQueue.dequeue();
+			this.nextTurn();
+		}
+	}
+
+	private OnDisplayRectangle(rect: Rect) {
+		this.rectQueue.push(rect);
+	}
+
+	private OnDisplayResized(size: Size) {
+		this.clients
+			.filter((c) => c.connectedToNode || c.viewMode == 1)
+			.forEach((c) => {
+				if (this.screenHidden && c.rank == Rank.Unregistered) return;
+				c.sendScreenResize(size.width, size.height);
+			});
+	}
+
+	private async OnDisplayFrame() {
+		let self = this;
+
+		let doRect = async (rect: Rect) => {
+			let encoded = await this.MakeRectData(rect);
+
+			self.clients
+				.filter((c) => c.connectedToNode || c.viewMode == 1)
+				.forEach((c) => {
+					if (self.screenHidden && c.rank == Rank.Unregistered) return;
+
+					c.sendScreenUpdate({
+						x: rect.x,
+						y: rect.y,
+						data: encoded
+					});
+				});
+		};
+
+		let promises: Promise<void>[] = [];
+
+		for (let rect of self.rectQueue) promises.push(doRect(rect));
+
+		// javascript is a very solidly designed language with no holes
+		// or usability traps inside of it whatsoever
+		this.rectQueue.length = 0;
+
+		await Promise.all(promises);
+	}
+
+	private async SendFullScreenWithSize(client: User) {
+		let display = this.VM.GetDisplay();
+		if (display == null) return;
+
+		let displaySize = display.Size();
+
+		let encoded = await this.MakeRectData({
+			x: 0,
+			y: 0,
+			width: displaySize.width,
+			height: displaySize.height
+		});
+
+		client.sendScreenResize(displaySize.width, displaySize.height);
+
+		client.sendScreenUpdate({
+			x: 0,
+			y: 0,
+			data: encoded
+		});
+	}
+
+	private async MakeRectData(rect: Rect) {
+		let display = this.VM.GetDisplay();
+
+		// TODO: actually throw an error here
+		if (display == null) return Buffer.from('no');
+
+		let displaySize = display.Size();
+		let encoded = await JPEGEncoder.Encode(display.Buffer(), displaySize, rect);
+
+		return encoded;
+	}
+
+	async getThumbnail(): Promise<Buffer> {
+		let display = this.VM.GetDisplay();
+
+		// oh well
+		if (!display?.Connected()) return Buffer.alloc(4);
+
+		return JPEGEncoder.EncodeThumbnail(display.Buffer(), display.Size());
+	}
+
+	startVote() {
+		if (this.voteInProgress) return;
+		this.voteInProgress = true;
+		this.logger.info({event: "vote/start"});
+		this.clients.forEach((c) => c.sendVoteStarted());
+		this.voteTime = this.Config.collabvm.voteTime;
+		this.voteInterval = setInterval(() => {
+			this.voteTime--;
+			if (this.voteTime < 1) {
+				this.endVote();
+			}
+		}, 1000);
+	}
+
+	endVote(result?: boolean) {
+		if (!this.voteInProgress) return;
+		this.voteInProgress = false;
+		clearInterval(this.voteInterval);
+		var count = this.getVoteCounts();
+		this.clients.forEach((c) => c.sendVoteEnded());
+		if (result === true || (result === undefined && count.yes >= count.no)) {
+			this.clients.forEach((c) => c.sendChatMessage('', 'The vote to reset the VM has won.'));
+			this.VM.Reset();
+		} else {
+			this.clients.forEach((c) => c.sendChatMessage('', 'The vote to reset the VM has lost.'));
+		}
+		this.clients.forEach((c) => {
+			c.IP.vote = null;
+		});
+		this.voteCooldown = this.Config.collabvm.voteCooldown;
+		this.voteCooldownInterval = setInterval(() => {
+			this.voteCooldown--;
+			if (this.voteCooldown < 1) clearInterval(this.voteCooldownInterval);
+		}, 1000);
+	}
+
+	sendVoteUpdate(client?: User) {
+		if (!this.voteInProgress) return;
+		var count = this.getVoteCounts();
+
+		if (client) client.sendVoteStats(this.voteTime * 1000, count.yes, count.no);
+		else this.clients.forEach((c) => c.sendVoteStats(this.voteTime * 1000, count.yes, count.no));
+	}
+
+	getVoteCounts(): VoteTally {
+		let yes = 0;
+		let no = 0;
+		IPDataManager.ForEachIPData((c) => {
+			if (c.vote === true) yes++;
+			if (c.vote === false) no++;
+		});
+		return { yes: yes, no: no };
+	}
 }
