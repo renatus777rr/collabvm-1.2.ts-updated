@@ -1,4 +1,5 @@
 # CollabVM1.2.ts updated
+## THE SERVER IS NOW FULLY FIXED. DO PULL UP REQUESTS, I WILL APPROVE IT.
 ## NOTE
 For auth and login https://github.com/renatus777rr/CollabVMAuthServerImproved/
 ## Prerequisites
