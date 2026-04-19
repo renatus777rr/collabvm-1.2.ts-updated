@@ -284,7 +284,7 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 					c.sendAddUser([
 						{
 							username: user.username!,
-							rank: user.rank
+							rank: this.getUserRank(user)
 						}
 					])
 				);
