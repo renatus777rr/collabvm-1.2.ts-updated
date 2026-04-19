@@ -7,7 +7,6 @@ You'll need:
 - A machine with decent specs (8GB of RAM and a modern CPU, probably)
 - A Linux distribution; You can pick any mainstream distro, for the purposes of this guide I recommend either Debian or Arch, or their OpenRC counterparts if you prefer OpenRC. Yes, Ubuntu will work, it's terrible though
 **If you REALLY want to run CollabVM on Windows, there is an unofficial and unsupported guide for that at [[UserVM Handbook/Windows]]**
-- A decently fast network that allows you to forward a port. We will not accept UserVMs behind services like ngrok. Cloudflare tunnels are fine. You must also have a URL that stays persistent. If your IP is dynamic, you can use services like NOIP or setup a script to auto-update your domain using cloudflare.
 - Basic knowledge of how computers and Linux systems work. We aren't going to hold your hand, you need to be comfortable with a command line
 **IF YOU DO NOT UNDERSTAND HOW TO FOLLOW THE INSTRUCTIONS IN THIS GUIDE, DO NOT HOST PUBLIC INTERNET CONNECTED VMS ON THE INTERNET THAT ANYONE CAN ACCESS**
 - A few hours
@@ -75,7 +74,7 @@ user@myownserver:~$ sudo -iu collabvm
 Now, we can clone the CollabVM Server source code:
 
 ```sh
-(collabvm) $ git clone https://github.com/computernewb/collabvm-1.2.ts.git /srv/collabvm/collab-vm-1.2-server-bettetweak --depth 1 --recursive
+(collabvm) $ git clone https://github.com/renatus777rr/collabvm-1.2.ts-updated.git /srv/collabvm/collab-vm-1.2-server-bettetweak --depth 1 --recursive
 (collabvm) $ cd /srv/collabvm/collab-vm-1.2-server-bettetweak
 ```
 
