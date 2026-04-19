@@ -8,334 +8,293 @@ import { CollabVMCapabilities } from '@cvmts/collab-vm-1.2-binary-protocol';
 import { pino, type Logger } from 'pino';
 import { v4 as uuid4 } from 'uuid';
 import { BanManager } from './BanManager.js';
-import { 
-  IProtocol, 
-  IProtocolMessageHandler, 
-  ListEntry, 
-  ProtocolAddUser, 
-  ProtocolChatHistory, 
-  ProtocolFlag, 
-  ProtocolRenameStatus, 
-  ProtocolUpgradeCapability, 
-  ScreenRect 
-} from './protocol/Protocol.js';
+import { IProtocol, IProtocolMessageHandler, ListEntry, ProtocolAddUser, ProtocolChatHistory, ProtocolFlag, ProtocolRenameStatus, ProtocolUpgradeCapability, ScreenRect } from './protocol/Protocol.js';
 import { TheProtocolManager } from './protocol/Manager.js';
 
-export enum Rank {
-  Unregistered = 0,
-  Registered = 1,
-  Admin = 2,
-  Moderator = 3
-}
-
-interface UserState {
-  readonly socket: NetworkClient;
-  readonly uuid: string;
-  readonly logger: Logger;
-  _username?: string;
-  connectedToNode: boolean;
-  viewMode: number;
-  rank: Rank;
-  turnWhitelist: boolean;
-  noFlag: boolean;
-  countryCode: string | null;
-  msgsSent: number;
-  config: IConfig;
-  ip: IPData;
-  capabilities: CollabVMCapabilities;
-  protocol: IProtocol;
-}
-
 export class User {
-  private readonly timers = new Map<string, NodeJS.Timeout>();
-  private readonly rateLimits = new Map<string, RateLimiter>();
+	socket: NetworkClient;
+	nopSendInterval: NodeJS.Timeout;
+	msgRecieveInterval: NodeJS.Timeout;
+	nopRecieveTimeout?: NodeJS.Timeout;
+	private _username?: string;
+	connectedToNode: boolean;
+	viewMode: number;
+	rank: Rank;
+	msgsSent: number;
+	Config: IConfig;
+	IP: IPData;
+	Capabilities: CollabVMCapabilities;
+	protocol: IProtocol;
+	turnWhitelist: boolean = false;
+	// Hide flag. Only takes effect if the user is logged in.
+	noFlag: boolean = false;
+	countryCode: string | null = null;
+	// Rate limiters
+	ChatRateLimit: RateLimiter;
+	LoginRateLimit: RateLimiter;
+	RenameRateLimit: RateLimiter;
+	TurnRateLimit: RateLimiter;
+	VoteRateLimit: RateLimiter;
+	uuid: string;
 
-  constructor(
-    socket: NetworkClient, 
-    protocol: string, 
-    ip: IPData, 
-    config: IConfig, 
-    username?: string, 
-    node?: string
-  ) {
-    this.state = {
-      socket,
-      uuid: uuid4(),
-      logger: pino().child({ name: "CVMTS.User", "uuid/user": uuid4(), ip: ip.address }),
-      connectedToNode: false,
-      viewMode: -1,
-      rank: Rank.Unregistered,
-      turnWhitelist: false,
-      noFlag: false,
-      countryCode: null,
-      msgsSent: 0,
-      config,
-      ip,
-      capabilities: new CollabVMCapabilities(),
-      protocol: TheProtocolManager.getProtocol(protocol)
-    };
+	logger: Logger;
 
-    this.setupSocketHandlers();
-    this.setupRateLimiters(config);
-    this.startHeartbeat();
-    this.setupIPRef(ip);
-    
-    if (username) this.username = username;
-  }
+	constructor(socket: NetworkClient, protocol: string, ip: IPData, config: IConfig, username?: string, node?: string) {
+		this.IP = ip;
+		this.connectedToNode = false;
+		this.viewMode = -1;
+		this.Config = config;
+		this.socket = socket;
+		this.msgsSent = 0;
+		this.uuid = uuid4();
+		this.logger = pino().child({
+			name: "CVMTS.User",
+			"uuid/user": this.uuid,
+			ip: ip.address,
+		});
+		this.Capabilities = new CollabVMCapabilities();
 
-  private state: UserState;
+		// All clients default to the Guacamole protocol.
+		this.protocol = TheProtocolManager.getProtocol(protocol);
 
-  private setupSocketHandlers() {
-    this.state.socket.on('disconnect', () => {
-      this.state.ip.Unref();
-      this.clearAllTimers();
-      this.state.logger.debug({ event: "user/disconnected" });
-    });
-  }
+		this.socket.on('disconnect', () => {
+			this.logger.info({event: "user disconnected", username});
+			// Unref the ip data for this connection
+			this.IP.Unref();
 
-  private setupRateLimiters(config: IConfig) {
-    const limits = [
-      ['chat', config.collabvm.automute.messages, config.collabvm.automute.seconds, () => this.mute(false)],
-      ['rename', 3, 60, () => this.close()],
-      ['login', 4, 3, () => this.close()],
-      ['turn', 5, 3, () => this.close()],
-      ['vote', 3, 3, () => this.close()]
-    ];
+			clearInterval(this.nopSendInterval);
+			clearInterval(this.msgRecieveInterval);
+		});
 
-    limits.forEach(([name, max, window, onLimit]) => {
-      const limiter = new RateLimiter(max, window);
-      limiter.on('limit', onLimit);
-      this.rateLimits.set(name, limiter);
-    });
-  }
 
-  private setupIPRef(ip: IPData) {
-    ip.Ref();
-  }
+		this.nopSendInterval = setInterval(() => this.sendNop(), 5000);
+		this.msgRecieveInterval = setInterval(() => this.onNoMsg(), 10000);
+		this.sendNop();
+		if (username) this.username = username;
+		this.rank = 0;
+		this.ChatRateLimit = new RateLimiter(this.Config.collabvm.automute.messages, this.Config.collabvm.automute.seconds);
+		this.ChatRateLimit.on('limit', () => this.mute(false));
+		this.RenameRateLimit = new RateLimiter(3, 60);
+		this.RenameRateLimit.on('limit', () => this.closeConnection());
+		this.LoginRateLimit = new RateLimiter(4, 3);
+		this.LoginRateLimit.on('limit', () => this.closeConnection());
+		this.TurnRateLimit = new RateLimiter(5, 3);
+		this.TurnRateLimit.on('limit', () => this.closeConnection());
+		this.VoteRateLimit = new RateLimiter(3, 3);
+		this.VoteRateLimit.on('limit', () => this.closeConnection());
+	}
 
-  private startHeartbeat() {
-    this.setTimer('nopSend', setInterval(() => this.sendNop(), 5000), 5000);
-    this.setTimer('msgCheck', setInterval(() => this.checkMsgTimeout(), 10000), 10000);
-    this.sendNop();
-  }
+	assignGuestName(existingUsers: string[]): string {
+		var username;
+		do {
+			username = 'guest' + Utilities.Randint(10000, 99999);
+		} while (existingUsers.indexOf(username) !== -1);
+		this.logger.info({event: "assign guest username"});
+		this.username = username;
+		return username;
+	}
 
-  assignGuestName(existing: string[]): string {
-    let name: string;
-    do {
-      name = `guest${Utilities.Randint(10000, 99999)}`;
-    } while (existing.includes(name));
-    
-    this.username = name;
-    return name;
-  }
+	onNop() {
+		clearTimeout(this.nopRecieveTimeout);
+		clearInterval(this.msgRecieveInterval);
+		this.msgRecieveInterval = setInterval(() => this.onNoMsg(), 10000);
+	}
 
-  get username(): string {
-    return this.state._username!;
-  }
+	sendMsg(msg: string) {
+		if (!this.socket.isOpen()) return;
+		clearInterval(this.nopSendInterval);
+		this.nopSendInterval = setInterval(() => this.sendNop(), 5000);
+		this.socket.send(msg);
+	}
 
-  set username(name: string) {
-    this.state.logger = this.state.logger.child({ username: name });
-    this.state._username = name;
-  }
+	private onNoMsg() {
+		this.sendNop();
+		this.nopRecieveTimeout = setTimeout(() => {
+			this.logger.info({event: "nop timeout"});
+			this.closeConnection();
+		}, 3000);
+	}
 
-  get ChatRateLimit(): RateLimiter { return this.rateLimits.get('chat')!; }
-  get RenameRateLimit(): RateLimiter { return this.rateLimits.get('rename')!; }
-  get LoginRateLimit(): RateLimiter { return this.rateLimits.get('login')!; }
-  get TurnRateLimit(): RateLimiter { return this.rateLimits.get('turn')!; }
-  get VoteRateLimit(): RateLimiter { return this.rateLimits.get('vote')!; }
+	closeConnection() {
+		this.logger.info({event: "closing connection"});
+		this.socket.send(cvm.guacEncode('disconnect'));
+		this.socket.close();
+	}
 
-  onNop() {
-    this.clearTimer('nopTimeout');
-    this.resetMsgCheck();
-  }
+	onChatMsgSent() {
+		if (!this.Config.collabvm.automute.enabled) return;
+		// rate limit guest and unregistered chat messages, but not staff ones
+		switch (this.rank) {
+			case Rank.Moderator:
+			case Rank.Admin:
+				break;
 
-  sendMsg(msg: string) {
-    if (this.state.socket.isOpen()) {
-      this.resetNopTimer();
-      this.state.socket.send(msg);
-    }
-  }
+			default:
+				this.ChatRateLimit.request();
+				break;
+		}
+	}
 
-  private resetNopTimer() {
-    this.clearTimer('nopSend');
-    this.setTimer('nopSend', setInterval(() => this.sendNop(), 5000), 5000);
-  }
+	mute(permanent: boolean) {
+		this.logger.info({event: "mute", time_seconds: this.Config.collabvm.tempMuteTime, permanent});
+		this.IP.muted = true;
+		this.sendMsg(cvm.guacEncode('chat', '', `You have been muted${permanent ? '' : ` for ${this.Config.collabvm.tempMuteTime} seconds`}.`));
+		if (!permanent) {
+			clearTimeout(this.IP.tempMuteExpireTimeout);
+			this.IP.tempMuteExpireTimeout = setTimeout(() => this.unmute(), this.Config.collabvm.tempMuteTime * 1000);
+		}
+	}
 
-  private checkMsgTimeout() {
-    this.sendNop();
-    this.setTimer('nopTimeout', setTimeout(() => this.close(), 3000), 3000);
-  }
+	unmute() {
+		this.logger.info({event: "unmute"});
+		clearTimeout(this.IP.tempMuteExpireTimeout);
+		this.IP.muted = false;
+		this.sendMsg(cvm.guacEncode('chat', '', 'You are no longer muted.'));
+	}
 
-  private resetMsgCheck() {
-    this.clearTimer('msgCheck');
-    this.setTimer('msgCheck', setInterval(() => this.checkMsgTimeout(), 10000), 10000);
-  }
+	async ban(banmgr: BanManager) {
+		this.logger.info({event: "ban"});
+		// Prevent the user from taking turns or chatting, in case the ban command takes a while
+		this.IP.muted = true;
+		await banmgr.BanUser(this.IP.address, this.username || '');
+		await this.kick();
+	}
 
-  processMessage(handler: IProtocolMessageHandler, buffer: Buffer) {
-    this.state.protocol.processMessage(this, handler, buffer);
-  }
+	async kick() {
+		this.logger.info({event: "kick"});
+		this.sendMsg('10.disconnect;');
+		this.socket.close();
+	}
 
-  sendNop() {
-    this.state.protocol.sendNop(this);
-  }
+	// These wrap the currently set IProtocol instance to feed state to them.
+	// This is probably grody, but /shrug. It works, and feels less awful than
+	// manually wrapping state (and probably prevents mixup bugs too.)
 
-  sendSync(now: number) {
-    this.state.protocol.sendSync(this, now);
-  }
+	processMessage(handler: IProtocolMessageHandler, buffer: Buffer) {
+		this.protocol.processMessage(this, handler, buffer);
+	}
 
-  sendAuth(url: string) {
-    this.state.protocol.sendAuth(this, url);
-  }
+	sendNop(): void {
+		this.protocol.sendNop(this);
+	}
+	
+	sendSync(now: number): void {
+		this.protocol.sendSync(this, now);
+	}
 
-  sendCapabilities(caps: ProtocolUpgradeCapability[]) {
-    this.state.protocol.sendCapabilities(this, caps);
-  }
+	sendAuth(authServer: string): void {
+		this.protocol.sendAuth(this, authServer);
+	}
 
-  sendConnectFailResponse() {
-    this.state.protocol.sendConnectFailResponse(this);
-  }
+	sendCapabilities(caps: ProtocolUpgradeCapability[]): void {
+		this.protocol.sendCapabilities(this, caps);
+	}
 
-  sendConnectOKResponse(votes: boolean) {
-    this.state.protocol.sendConnectOKResponse(this, votes);
-  }
+	sendConnectFailResponse(): void {
+		this.protocol.sendConnectFailResponse(this);
+	}
 
-  sendLoginResponse(ok: boolean, message?: string) {
-    this.state.protocol.sendLoginResponse(this, ok, message);
-  }
+	sendConnectOKResponse(votes: boolean): void {
+		this.protocol.sendConnectOKResponse(this, votes);
+	}
 
-  sendAdminLoginResponse(ok: boolean, modPerms?: number) {
-    this.state.protocol.sendAdminLoginResponse(this, ok, modPerms);
-  }
+	sendLoginResponse(ok: boolean, message: string | undefined): void {
+		this.protocol.sendLoginResponse(this, ok, message);
+	}
 
-  sendAdminMonitorResponse(output: string) {
-    this.state.protocol.sendAdminMonitorResponse(this, output);
-  }
+	sendAdminLoginResponse(ok: boolean, modPerms: number | undefined): void {
+		this.protocol.sendAdminLoginResponse(this, ok, modPerms);
+	}
 
-  sendAdminIPResponse(username: string, ip: string) {
-    this.state.protocol.sendAdminIPResponse(this, username, ip);
-  }
+	sendAdminMonitorResponse(output: string): void {
+		this.protocol.sendAdminMonitorResponse(this, output);
+	}
 
-  sendChatMessage(username: string | '', message: string) {
-    this.state.protocol.sendChatMessage(this, username, message);
-  }
+	sendAdminIPResponse(username: string, ip: string): void {
+		this.protocol.sendAdminIPResponse(this, username, ip);
+	}
 
-  sendChatHistoryMessage(history: ProtocolChatHistory[]) {
-    this.state.protocol.sendChatHistoryMessage(this, history);
-  }
+	sendChatMessage(username: '' | string, message: string): void {
+		this.protocol.sendChatMessage(this, username, message);
+	}
 
-  sendAddUser(users: ProtocolAddUser[]) {
-    this.state.protocol.sendAddUser(this, users);
-  }
+	sendChatHistoryMessage(history: ProtocolChatHistory[]): void {
+		this.protocol.sendChatHistoryMessage(this, history);
+	}
 
-  sendRemUser(users: string[]) {
-    this.state.protocol.sendRemUser(this, users);
-  }
+	sendAddUser(users: ProtocolAddUser[]): void {
+		this.protocol.sendAddUser(this, users);
+	}
 
-  sendFlag(flags: ProtocolFlag[]) {
-    this.state.protocol.sendFlag(this, flags);
-  }
+	sendRemUser(users: string[]): void {
+		this.protocol.sendRemUser(this, users);
+	}
 
-  sendSelfRename(status: ProtocolRenameStatus, username: string, rank: Rank) {
-    this.state.protocol.sendSelfRename(this, status, username, rank);
-  }
+	sendFlag(flag: ProtocolFlag[]): void {
+		this.protocol.sendFlag(this, flag);
+	}
 
-  sendRename(old: string, newName: string, rank: Rank) {
-    this.state.protocol.sendRename(this, old, newName, rank);
-  }
+	sendSelfRename(status: ProtocolRenameStatus, newUsername: string, rank: Rank): void {
+		this.protocol.sendSelfRename(this, status, newUsername, rank);
+	}
 
-  sendListResponse(list: ListEntry[]) {
-    this.state.protocol.sendListResponse(this, list);
-  }
+	sendRename(oldUsername: string, newUsername: string, rank: Rank): void {
+		this.protocol.sendRename(this, oldUsername, newUsername, rank);
+	}
 
-  sendTurnQueue(time: number, users: string[]) {
-    this.state.protocol.sendTurnQueue(this, time, users);
-  }
+	sendListResponse(list: ListEntry[]): void {
+		this.protocol.sendListResponse(this, list);
+	}
 
-  sendTurnQueueWaiting(time: number, users: string[], wait: number) {
-    this.state.protocol.sendTurnQueueWaiting(this, time, users, wait);
-  }
+	sendTurnQueue(turnTime: number, users: string[]): void {
+		this.protocol.sendTurnQueue(this, turnTime, users);
+	}
 
-  sendVoteStarted() {
-    this.state.protocol.sendVoteStarted(this);
-  }
+	sendTurnQueueWaiting(turnTime: number, users: string[], waitTime: number): void {
+		this.protocol.sendTurnQueueWaiting(this, turnTime, users, waitTime);
+	}
 
-  sendVoteStats(ms: number, yes: number, no: number) {
-    this.state.protocol.sendVoteStats(this, ms, yes, no);
-  }
+	sendVoteStarted(): void {
+		this.protocol.sendVoteStarted(this);
+	}
 
-  sendVoteEnded() {
-    this.state.protocol.sendVoteEnded(this);
-  }
+	sendVoteStats(msLeft: number, nrYes: number, nrNo: number): void {
+		this.protocol.sendVoteStats(this, msLeft, nrYes, nrNo);
+	}
 
-  sendVoteCooldown(ms: number) {
-    this.state.protocol.sendVoteCooldown(this, ms);
-  }
+	sendVoteEnded(): void {
+		this.protocol.sendVoteEnded(this);
+	}
 
-  sendScreenResize(width: number, height: number) {
-    this.state.protocol.sendScreenResize(this, width, height);
-  }
+	sendVoteCooldown(ms: number): void {
+		this.protocol.sendVoteCooldown(this, ms);
+	}
 
-  sendScreenUpdate(rect: ScreenRect) {
-    this.state.protocol.sendScreenUpdate(this, rect);
-  }
+	sendScreenResize(width: number, height: number): void {
+		this.protocol.sendScreenResize(this, width, height);
+	}
 
-  onChatMsgSent() {
-    if (!this.state.config.collabvm.automute.enabled || this.state.rank >= Rank.Moderator) return;
-    this.ChatRateLimit.request();
-  }
+	sendScreenUpdate(rect: ScreenRect): void {
+		this.protocol.sendScreenUpdate(this, rect);
+	}
 
-  mute(permanent: boolean) {
-    this.state.ip.muted = true;
-    this.sendMsg(cvm.guacEncode('chat', '', 
-      `You have been muted${permanent ? '' : ` for ${this.state.config.collabvm.tempMuteTime}s`}`
-    ));
-    
-    if (!permanent) {
-      this.setTimer('muteExpire', setTimeout(() => this.unmute(), this.state.config.collabvm.tempMuteTime * 1000), 0);
-    }
-  }
+	get username(): string {
+		return this._username!;
+	}
 
-  unmute() {
-    this.clearTimer('muteExpire');
-    this.state.ip.muted = false;
-    this.sendMsg(cvm.guacEncode('chat', '', 'You are no longer muted.'));
-  }
+	set username(updated: string) {
+		this.logger = this.logger.child({
+			username: updated,
+		});
 
-  async ban(banmgr: BanManager) {
-    this.state.ip.muted = true;
-    await banmgr.BanUser(this.state.ip.address, this.username);
-    await this.kick();
-  }
+		this._username = updated;
+	}
+}
 
-  async kick() {
-    this.sendMsg('10.disconnect;');
-    this.state.socket.close();
-  }
-
-  close() {
-    this.state.socket.send(cvm.guacEncode('disconnect'));
-    this.state.socket.close();
-  }
-
-  private setTimer(name: string, timer: NodeJS.Timeout, duration: number) {
-    this.clearTimer(name);
-    this.timers.set(name, timer);
-  }
-
-  private clearTimer(name: string) {
-    const timer = this.timers.get(name);
-    if (timer) {
-      clearTimeout(timer);
-      clearInterval(timer);
-      this.timers.delete(name);
-    }
-  }
-
-  private clearAllTimers() {
-    this.timers.forEach(timer => {
-      clearTimeout(timer);
-      clearInterval(timer);
-    });
-    this.timers.clear();
-  }
+export enum Rank {
+	Unregistered = 0,
+	// After all these years
+	Registered = 1,
+	Admin = 2,
+	Moderator = 3
 }
