@@ -1,6 +1,6 @@
 # CollabVM1.2.ts updated
 ## NOTE
-For auth and login you need CollabVM Auth Server, which is at https://git.computernewb.com/collabvm/CollabVMAuthServer. I will think so i will update this one and improve.
+For auth and login https://github.com/renatus777rr/CollabVMAuthServerImproved/
 ## Prerequisites
 
 You'll need:
