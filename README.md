@@ -143,7 +143,7 @@ Or alternatively, to run it directly:
 You'll probably want to test it out for yourself. For that, we'll throw up a test webapp. Start by cloning the source:
 
 ```sh
-user@myownserver:~$ git clone https://github.com/computernewb/collab-vm-1.2-webapp.git --recursive
+user@myownserver:~$ git clone https://github.com/renatus777rr/collab-vm-1.2-webapp.git --recursive
 user@myownserver:~$ cd collab-vm-1.2-webapp
 ```
 
